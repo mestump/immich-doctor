@@ -2,6 +2,8 @@
 # Immich doctor — one-shot diagnose + AI-fix for an Immich stack on Unraid.
 # Usage (as root in the Unraid web terminal):
 #   curl -fsSL https://mestump.github.io/immich-doctor/doctor.sh | bash -s -- <API_KEY>
+# Optional: prefix PUBLIC_URL=http://<tailscale-ip-or-host>:2283 to also verify
+# the URL you actually use (e.g. over Tailscale). Without it, only local checks run.
 #
 # Collects a diagnostic bundle, sends it to the Spark model behind
 # llm.plexivision.tv, applies vetted fix commands, re-verifies, reports.
@@ -10,7 +12,7 @@ set -u
 API_KEY="${1:-}"
 API_URL="${API_URL:-https://llm.plexivision.tv/v1/chat/completions}"
 MODEL="${MODEL:-spark-prod}"
-SELF_URL="${SELF_URL:-https://immich.plexivision.tv/api}"
+PUBLIC_URL="${PUBLIC_URL:-}"   # e.g. http://100.x.y.z:2283 — verified only if set
 
 say() { printf '\033[1;34m[doctor]\033[0m %s\n' "$*"; }
 ok()  { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
@@ -39,7 +41,7 @@ cap "listeners 2283/8080/3001" ss -lntp
 cap "local probes" bash -c 'for p in 2283 8080 3001; do
   printf "port %s: " "$p"
   curl -s -m 4 -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:${p}/" 2>/dev/null || echo fail
-done; curl -s -m 8 -o /dev/null -w "public %s\n" "%{http_code}" '"${PUBLIC_URL:-https://immich.plexivision.tv/}"''
+done; if [ -n "$1" ]; then curl -s -m 8 -o /dev/null -w "user URL %s\n" "%{http_code}" "$1"; fi' _ "$PUBLIC_URL"
 
 for c in immich immich-server immich_postgres immich-postgres immich_redis immich-redis immich-machine-learning; do
   if docker inspect "$c" >/dev/null 2>&1; then
@@ -103,11 +105,25 @@ say "re-verifying..."
 sleep 8
 CODE=$(curl -s -m 8 -o /dev/null -w "%{http_code}" http://127.0.0.1:2283/ 2>/dev/null || echo 000)
 [ "$CODE" = "000" ] && CODE=$(curl -s -m 8 -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/ 2>/dev/null || echo 000)
-PCODE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "${PUBLIC_URL:-https://immich.plexivision.tv/}" 2>/dev/null || echo 000)
+if [ "$CODE" = "000" ]; then
+  # fall back to any port with a listening socket that looks like Immich
+  for p in $(ss -lnt | awk 'NR>1 {split($4,a,":"); print a[length(a)]}' | sort -un); do
+    c=$(curl -s -m 4 -o /dev/null -w "%{http_code}" "http://127.0.0.1:${p}/" 2>/dev/null || echo 000)
+    case "$c" in 200|302|307|401) curl -s -m 4 "http://127.0.0.1:${p}/" | grep -qi "immich" && { CODE=$c; break; };; esac
+  done
+fi
+PCODE=""
+[ -n "$PUBLIC_URL" ] && PCODE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "$PUBLIC_URL" 2>/dev/null || echo 000)
 if echo "$CODE" | grep -qE '200|302|307|401'; then
-  ok "Immich API responds locally (HTTP $CODE)"
-  if [ "$PCODE" = "200" ] || [ "$PCODE" = "302" ]; then ok "public URL works (HTTP $PCODE) — you are done, open the Immich app"; exit 0
-  else bad "local is up but public URL returned HTTP $PCODE — ask Mike to check the router/tunnel"; exit 1; fi
+  ok "Immich responds locally (HTTP $CODE)"
+  if [ -z "$PCODE" ]; then
+    ok "you are done — open the Immich app"
+  elif [ "$PCODE" = "200" ] || [ "$PCODE" = "302" ] || [ "$PCODE" = "307" ]; then
+    ok "your Immich URL works (HTTP $PCODE) — you are done, open the Immich app"
+  else
+    bad "server is up but your URL returned HTTP $PCODE — check Tailscale is connected, then ask Mike"
+    cp "$BUNDLE" /tmp/immich-doctor-bundle.txt; exit 1
+  fi
 else
   bad "Immich still not answering (HTTP $CODE)"
   [ -n "$HUMAN" ] || [ "$NEEDS_HUMAN" = true ] && printf '\033[1;33mA human needs to help:\033[0m %s\n' "$HUMAN"
