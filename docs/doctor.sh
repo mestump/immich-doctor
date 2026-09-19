@@ -24,9 +24,9 @@ trap 'rm -rf "$TMP"' EXIT
 # ---------------------------------------------------------------- gather
 say "collecting diagnostics..."
 BUNDLE="$TMP/bundle.txt"
-cap() { # cap LABEL CMD...  -> run cmd, keep first 4000 chars
+cap() { # cap LABEL CMD...  -> run cmd, keep first 2500 chars
   local label="$1"; shift
-  { printf '\n===== %s =====\n' "$label"; "$@" 2>&1 | head -c 4000; printf '\n'; } >>"$BUNDLE"
+  { printf '\n===== %s =====\n' "$label"; "$@" 2>&1 | head -c 2500; printf '\n'; } >>"$BUNDLE"
 }
 : >"$BUNDLE"
 printf '===== host =====\n' >>"$BUNDLE"
@@ -58,7 +58,7 @@ jq -n --arg b "$(cat "$BUNDLE")" --arg m "$MODEL" '{
     {role:"user", content: $b}
   ]}' >"$PAYLOAD"
 
-REPLY=$(curl -sS -m 90 "$API_URL" -H "Content-Type: application/json" \
+REPLY=$(curl -sS -m 240 --retry 2 --retry-delay 5 "$API_URL" -H "Content-Type: application/json" \
   -H "Authorization: Bearer ${API_KEY}" --data @"$PAYLOAD")
 echo "$REPLY" >"$TMP/reply.json"
 
