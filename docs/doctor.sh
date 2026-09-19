@@ -38,8 +38,8 @@ cap "free mem" free -m
 cap "listeners 2283/8080/3001" ss -lntp
 cap "local probes" bash -c 'for p in 2283 8080 3001; do
   printf "port %s: " "$p"
-  curl -s -m 4 -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:${p}/api" 2>/dev/null || echo fail
-done; curl -s -m 8 -o /dev/null -w "public %s\n" "%{http_code}" '"$SELF_URL"''
+  curl -s -m 4 -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:${p}/" 2>/dev/null || echo fail
+done; curl -s -m 8 -o /dev/null -w "public %s\n" "%{http_code}" '"${PUBLIC_URL:-https://immich.plexivision.tv/}"''
 
 for c in immich immich-server immich_postgres immich-postgres immich_redis immich-redis immich-machine-learning; do
   if docker inspect "$c" >/dev/null 2>&1; then
@@ -99,9 +99,9 @@ fi
 # ---------------------------------------------------------------- re-verify
 say "re-verifying..."
 sleep 8
-CODE=$(curl -s -m 8 -o /dev/null -w "%{http_code}" http://127.0.0.1:2283/api 2>/dev/null || echo 000)
-[ "$CODE" = "000" ] && CODE=$(curl -s -m 8 -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api 2>/dev/null || echo 000)
-PCODE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "$SELF_URL" 2>/dev/null || echo 000)
+CODE=$(curl -s -m 8 -o /dev/null -w "%{http_code}" http://127.0.0.1:2283/ 2>/dev/null || echo 000)
+[ "$CODE" = "000" ] && CODE=$(curl -s -m 8 -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/ 2>/dev/null || echo 000)
+PCODE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "${PUBLIC_URL:-https://immich.plexivision.tv/}" 2>/dev/null || echo 000)
 if echo "$CODE" | grep -qE '200|302|307|401'; then
   ok "Immich API responds locally (HTTP $CODE)"
   if [ "$PCODE" = "200" ] || [ "$PCODE" = "302" ]; then ok "public URL works (HTTP $PCODE) — you are done, open the Immich app"; exit 0
