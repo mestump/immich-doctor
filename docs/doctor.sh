@@ -52,7 +52,8 @@ done
 say "asking Spark to assess ($API_URL)..."
 PAYLOAD="$TMP/payload.json"
 jq -n --arg b "$(cat "$BUNDLE")" --arg m "$MODEL" '{
-  model: $m, temperature: 0.2, max_tokens: 1500,
+  model: $m, temperature: 0.2, max_tokens: 1200,
+  chat_template_kwargs: {thinking: false, enable_thinking: false},
   messages: [
     {role:"system", content: "You are an Immich-on-Unraid repair agent. You receive a diagnostic bundle from the server. Known traps: Unraid webUI owns port 8080 (an Immich template using host port 8080 never binds); imagegenius template needs separate postgres+redis; official stack uses 2283; restart policy no/never means a crash or reboot keeps it down; unhealthy postgres/redis keeps the web UI down. Reply with STRICT JSON only, no prose, no markdown fences: {\"summary\": \"one or two sentences for a non-expert\", \"severity\": \"ok|minor|major\", \"fix_commands\": [\"shell commands, max 4, safe non-destructive only: docker start/restart/update, docker-compose/docker compose up -d, systemctl restart docker, nothing else\"], \"needs_human\": true|false, \"human_note\": \"what a human must do by hand, empty string if none\"}. If everything is healthy: severity ok, empty fix_commands, needs_human false."},
     {role:"user", content: $b}
@@ -62,7 +63,8 @@ REPLY=$(curl -sS -m 240 --retry 2 --retry-delay 5 "$API_URL" -H "Content-Type: a
   -H "Authorization: Bearer ${API_KEY}" --data @"$PAYLOAD")
 echo "$REPLY" >"$TMP/reply.json"
 
-CONTENT=$(echo "$REPLY" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+# reasoning models may park the answer in reasoning_content; prefer content
+CONTENT=$(echo "$REPLY" | jq -r '(.choices[0].message.content // .choices[0].message.reasoning) // empty' 2>/dev/null)
 if [ -z "${CONTENT:-}" ]; then
   bad "API call failed:"; echo "$REPLY" | head -c 400; echo
   bad "bundle saved for a human at /tmp/immich-doctor-bundle.txt"
