@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Immich doctor — one-shot diagnose + AI-fix for an Immich stack on Unraid.
-# Usage (as root in the Unraid web terminal):
-#   curl -fsSL https://mestump.github.io/immich-doctor/doctor.sh | bash -s -- <API_KEY>
+# Usage (as root in the Unraid web terminal) — no key needed, it self-fetches:
+#   curl -fsSL https://mestump.github.io/immich-doctor/doctor.sh | bash
+# Or pass a key explicitly:  ... | bash -s -- sk-...
 # Optional: prefix PUBLIC_URL=http://<tailscale-ip-or-host>:2283 to also verify
 # the URL you actually use (e.g. over Tailscale). Without it, only local checks run.
 #
@@ -13,6 +14,20 @@ API_KEY="${1:-}"
 API_URL="${API_URL:-https://llm.plexivision.tv/v1/chat/completions}"
 MODEL="${MODEL:-spark-prod}"
 PUBLIC_URL="${PUBLIC_URL:-}"   # e.g. http://100.x.y.z:2283 — verified only if set
+
+# If the key wasn't passed as an argument, look for doctor-key.txt next to this
+# script. The Pages host ships that file, so the one-liner
+#   curl -fsSL https://mestump.github.io/immich-doctor/doctor.sh | bash
+# works with no key on the command line.
+if [ -z "${API_KEY:-}" ]; then
+  for cand in "$(dirname "${BASH_SOURCE[0]:-$0}")/doctor-key.txt" ./doctor-key.txt /tmp/doctor-key.txt; do
+    if [ -f "$cand" ]; then API_KEY="$(tr -d '[:space:]' < "$cand")"; break; fi
+  done
+  # piped-from-URL fallback: fetch the key file from the same base URL
+  if [ -z "${API_KEY:-}" ]; then
+    API_KEY="$(curl -fsSL -m 15 "${DOCTOR_BASE:-https://mestump.github.io/immich-doctor}/doctor-key.txt" 2>/dev/null | tr -d '[:space:]' || true)"
+  fi
+fi
 
 say() { printf '\033[1;34m[doctor]\033[0m %s\n' "$*"; }
 ok()  { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
