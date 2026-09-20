@@ -17,8 +17,18 @@ if [ "$1" = inspect ]; then
     *Networks*)     grep -q "^network connect .*$c$" "$log" && echo "bridge immich-net " || echo "bridge "; exit 0;;
     *State.Status*) echo "running nohc"; exit 0;;
   esac
+  # raw inspect, for t_set_env's rebuild-from-inspect path
+  if [ "$2" = "$c" ]; then
+    cat <<J
+[{"Name":"/$c","Config":{"Image":"ghcr.io/imagegenius/immich","Env":["DB_HOSTNAME=immich-postgres","DB_PORT=5432","PUID=99"],"Labels":{}},
+  "HostConfig":{"RestartPolicy":{"Name":"unless-stopped"},"NetworkMode":"bridge","Binds":["/mnt/user/photos:/photos:rw"],"PortBindings":{"8080/tcp":[{"HostIp":"","HostPort":"8082"}]}},
+  "Mounts":[{"Type":"bind","Destination":"/photos"}]}]
+J
+    exit 0
+  fi
   exit 0
 fi
+[ "$1" = "image" ] && { echo '[{"Config":{"Env":["PATH=/usr/bin"],"Labels":{}}}]'; exit 0; }
 [ "$1 $2" = "network inspect" ] && { grep -q '^network create' "$log"; exit $?; }
 [ "$1 $2" = "network create" ] && exit 0
 [ "$1 $2" = "network connect" ] && exit 0

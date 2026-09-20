@@ -25,6 +25,10 @@ MODEL="${MODEL:-spark-prod}"
 MAX_ROUNDS="${MAX_ROUNDS:-8}"
 WEB_URL="${PUBLIC_URL:-http://127.0.0.1:2283/}"
 CFG="${CFG:-/boot/config/docker.cfg}"
+# Real dockerMan templates are one XML file per container here — NOT in docker.cfg,
+# which is the Docker service config. Looking in the wrong place made every template
+# read as "MISSING (compose-managed?)" on every box.
+TPLDIR="${TPLDIR:-/boot/config/plugins/dockerMan/templates-user}"
 BAK="${BAK:-/root/immich-doctor-backups}"
 TS=$(date +%Y%m%d-%H%M%S)
 mkdir -p "$BAK"
@@ -86,9 +90,30 @@ ip_of() { docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{if $v
 template_block() { # name -> unescaped <container> block (model display)
   template_raw "$1" | sed 's/&quot;/"/g; s/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g'
 }
-template_raw() { # name -> RAW <container> block as stored (&quot;-escaped attrs)
+template_file() { grep -l "<Name>$1</Name>" "$TPLDIR"/*.xml 2>/dev/null | head -1; }
+template_raw() { # name -> the container's template XML, from templates-user or legacy docker.cfg
+  local f; f=$(template_file "$1")
+  [ -n "$f" ] && { cat "$f"; return 0; }
   [ -r "$CFG" ] || return 0
   awk -v RS='<container>' -v n="$1" 'index($0,"<Name>"n"</Name>"){print "<container>" $0; exit}' "$CFG" 2>/dev/null
+}
+# Unraid shows a variable's LABEL (Name) in bold and the env var it actually sets
+# (Target) under "Container Variable:". They are separate fields and can disagree —
+# dad's REDIS_HOSTNAME had Target="localhost.br", so immich never saw the variable.
+template_vars() { # name -> "LABEL -> ENVVAR = value" per Variable, flagging mismatches
+  local f; f=$(template_file "$1"); [ -n "$f" ] || return 0
+  sed -n 's:.*<Config \(.*Type="Variable".*\)</Config>.*:\1:p' "$f" | while IFS= read -r c; do
+    local lbl tgt val
+    lbl=$(printf '%s' "$c" | sed -n 's:.*Name="\([^"]*\)".*:\1:p')
+    tgt=$(printf '%s' "$c" | sed -n 's:.*Target="\([^"]*\)".*:\1:p')
+    val=$(printf '%s' "$c" | sed -n 's:.*>\(.*\)$:\1:p')
+    [ -n "$lbl" ] || continue
+    if [ "$lbl" != "$tgt" ]; then
+      echo "  $lbl -> sets env '$tgt' = $val   <<< MISMATCH: immich will never see $lbl"
+    else
+      echo "  $lbl = $val"
+    fi
+  done
 }
 xml_decode() { sed 's/&quot;/"/g; s/&#34;/"/g; s/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g'; }
 
@@ -118,8 +143,9 @@ probe() {
       if [ -n "$blk" ]; then
         echo "-- template: $n --"
         echo "$blk" | grep -E '<(PortMap|Vol |Environment|Network>|Registry|Repository|WebUI|extra_params|AlwaysRestart|Privileged)' | sed 's/^ *//' | head -30
+        template_vars "$n"
       else
-        echo "-- template: $n MISSING (compose-managed? GUI/dockerman cannot recreate it) --"
+        echo "-- template: $n not found in $TPLDIR nor $CFG --"
       fi
     done
 
@@ -332,6 +358,99 @@ net_join() { # container [alias] — idempotent
   else                 docker network connect "$DNET" "$c" >/dev/null 2>&1; fi
   if nets_of "$c" | grep -qw "$DNET"; then echo "  joined $c to $DNET${a:+ as \"$a\"}"; else echo "  FAILED to join $c"; return 1; fi
 }
+# --------------------------------------------- add an env var to a container
+# Env is immutable on a running container, and dad's stack has no dockerMan
+# template, so t_recreate cannot help. Rebuild from the container's OWN
+# inspect instead: same image, mounts, ports, labels, restart policy and
+# user-set env (image defaults filtered out via `docker image inspect`), plus
+# the one new variable. Same rename-rollback-health-gate contract as t_recreate.
+# ponytail: reconstructs the fields that matter, not every docker run flag.
+# A container needing --cap-add/--sysctl/--ulimit/a custom entrypoint will come
+# back without them; the health gate catches that and rolls back.
+ARG_JQ='.[0] as $c | ($ic[0][0].Config // {}) as $d |
+($c.HostConfig.Binds // []) as $binds |
+([$binds[] | split(":")[1]]) as $bdest |
+( ["--name", ($c.Name|ltrimstr("/")),
+   "--restart", ($c.HostConfig.RestartPolicy.Name // "no"),
+   "--network", (if ($c.HostConfig.NetworkMode // "bridge") == "default" then "bridge" else $c.HostConfig.NetworkMode end)]
++ ( ($c.Config.Env // [])
+    | map(select(. as $e | (($d.Env // []) | index($e)) | not))
+    | map(select(startswith($key + "=") | not))
+    | map(["-e", .]) | add // [] )
++ ["-e", ($key + "=" + $val)]
++ ( $binds | map(["-v", .]) | add // [] )
++ ( ($c.Mounts // []) | map(select(.Type == "volume" and (.Destination as $x | $bdest | index($x) | not)))
+    | map(["-v", (.Name + ":" + .Destination)]) | add // [] )
++ ( ($c.HostConfig.PortBindings // {}) | to_entries
+    | map(.key as $k | .value[]? | ["-p", (if .HostIp == "" or .HostIp == null then "" else .HostIp + ":" end) + .HostPort + ":" + ($k|split("/")[0])])
+    | add // [] )
++ ( ($c.HostConfig.Devices // []) | map(["--device", (.PathOnHost + ":" + .PathInContainer + ":" + .CgroupPermissions)]) | add // [] )
++ ( if $c.HostConfig.Privileged then ["--privileged"] else [] end )
++ ( ($c.Config.Labels // {}) | to_entries
+    | map(select(.key as $k | (($d.Labels // {}) | has($k)) | not))
+    | map(["--label", (.key + "=" + .value)]) | add // [] )
+) | .[] | . + "\u0000"'
+
+compose_file_of() { docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$1" 2>/dev/null | grep -v '^<no value>$'; }
+
+t_fix_template_targets() { # name — repair Config entries whose Target is not the env var the label names
+  local f bk n=0 lbl tgt c
+  f=$(template_file "$1"); [ -n "$f" ] || { echo "no template for $1"; return 1; }
+  bk="${f}.bak.$(date +%s)"; cp "$f" "$bk" || return 1
+  while IFS= read -r c; do
+    lbl=$(printf '%s' "$c" | sed -n 's:.*Name="\([^"]*\)".*:\1:p')
+    tgt=$(printf '%s' "$c" | sed -n 's:.*Target="\([^"]*\)".*:\1:p')
+    # ponytail: only repair a label that IS an env var name (SCREAMING_SNAKE). Friendly
+    # labels like "Photos Storage" are legitimate and must never be written into Target.
+    case "$lbl" in *[!A-Z0-9_]*|"") continue;; esac
+    [ "$lbl" = "$tgt" ] && continue
+    sed -i "s:\(<Config Name=\"$lbl\"[^>]*Target=\)\"$tgt\":\1\"$lbl\":" "$f" && {
+      echo "  template $1: $lbl set env '$tgt' -> now sets '$lbl'"; n=$((n+1)); }
+  done < <(sed -n 's:.*\(<Config [^>]*Type="Variable"[^>]*>\).*:\1:p' "$f")
+  if [ "$n" = 0 ]; then rm -f "$bk"; echo "  template $1: variable names already correct"; return 1; fi
+  echo "  template $1: $n repaired (backup $bk)"
+}
+
+t_set_env() { # NAME KEY VALUE
+  local name="$1" key="$2" val="$3" img cj ij args=() hc final t=0 st nm nv
+  [ -n "$name" ] && [ -n "$key" ] || { echo "usage: set_env NAME KEY VALUE"; return 1; }
+  cj="$TMP/insp.$name.json"; ij="$TMP/img.$name.json"
+  docker inspect "$name" >"$cj" 2>/dev/null || { echo "no container named $name"; return 1; }
+  img=$(jq -r '.[0].Config.Image' "$cj")
+  docker image inspect "$img" >"$ij" 2>/dev/null || echo '[{"Config":{}}]' >"$ij"
+  mapfile -d "" args < <(jq -j --slurpfile ic "$ij" --arg key "$key" --arg val "$val" "$ARG_JQ" "$cj")
+  [ "${#args[@]}" -gt 4 ] || { echo "REFUSED: could not rebuild run args for $name"; return 1; }
+
+  # same data guard as t_recreate: never come back with fewer mounts than we had
+  nm=$(jq -r '.[0].Mounts|length' "$cj"); nv=$(printf '%s\n' "${args[@]}" | grep -cx -- '-v')
+  if [ "${nm:-0}" -gt 0 ] && [ "$nv" -lt "$nm" ]; then
+    echo "REFUSED: $name has $nm mounts but rebuild yields $nv — not risking your photos"; return 1
+  fi
+  if [ "${DRYRUN:-0}" = 1 ]; then printf "DRYRUN: docker run -d"; printf " %q" "${args[@]}"; printf " %s\n" "$img"; return 0; fi
+
+  hc=$(jq -r 'if .[0].Config.Healthcheck then "yes" else "no" end' "$cj")
+  docker rename "$name" "${name}-agent-old" >/dev/null 2>&1 || true
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  if ! docker run -d "${args[@]}" "$img" >/dev/null 2>&1; then
+    docker rename "${name}-agent-old" "$name" >/dev/null 2>&1 && docker start "$name" >/dev/null 2>&1
+    echo "docker run FAILED — rolled back to previous $name"; return 1
+  fi
+  while [ $t -lt 120 ]; do
+    st=$(docker inspect -f "{{.State.Status}}{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$name" 2>/dev/null)
+    case "$st" in runninghealthy) break;; running) [ "$hc" = no ] && break;; esac
+    sleep 5; t=$((t+5))
+  done
+  final=$(docker inspect -f "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}nohc{{end}}" "$name" 2>/dev/null)
+  if [ "$final" = "running healthy" ] || [ "$final" = "running nohc" ]; then
+    docker rm -f "${name}-agent-old" >/dev/null 2>&1
+    echo "recreated $name with $key=$val: $final after ${t}s"
+  else
+    docker rm -f "$name" >/dev/null 2>&1
+    docker rename "${name}-agent-old" "$name" >/dev/null 2>&1 && docker start "$name" >/dev/null 2>&1
+    echo "HEALTH GATE FAILED ($final) — rolled back to previous $name"; return 1
+  fi
+}
+
 t_fix_dns() {
   local main pg rd n img want_db want_rd
   main=$(pick_main); [ -n "$main" ] || { echo "no main immich container found"; return 1; }
@@ -352,6 +471,28 @@ t_fix_dns() {
   t_wait_healthy "$main" 180
 }
 
+
+# A dockerMan template can name a variable REDIS_HOSTNAME in bold while its Target —
+# the env var actually handed to the container — is garbage. The container then starts
+# with the variable simply absent. Repair the template (durable across a GUI Apply),
+# then heal the running container so nobody has to touch the GUI.
+t_fix_env() { # main-container-name — ensure DB_HOSTNAME / REDIS_HOSTNAME exist
+  local main="$1" n img rd pg key want rc=1
+  for n in $(stack_names); do
+    img=$(docker inspect -f '{{.Config.Image}}' "$n" 2>/dev/null)
+    case "$img" in *redis*|*valkey*) rd="$n";; *postgres*|*pgvecto*|*pgvector*) pg="$n";; esac
+  done
+  t_fix_template_targets "$main" >/dev/null 2>&1 && echo "  repaired variable names in the $main template"
+  for key in DB_HOSTNAME REDIS_HOSTNAME; do
+    [ -n "$(env_of "$main" "$key")" ] && continue
+    case "$key" in DB_HOSTNAME) want="$pg";; *) want="$rd";; esac
+    [ -n "$want" ] || { echo "  $key is missing and no container to point it at"; continue; }
+    echo "  $main never received $key — setting it to $want"
+    t_set_env "$main" "$key" "$want" && rc=0
+  done
+  return $rc
+}
+
 run_tool() {
   case "$1" in
     inspect)        t_inspect "${ARGS[@]:-all}" ;;
@@ -369,6 +510,8 @@ run_tool() {
     restart)        t_restart "${ARGS[@]}" ;;
     wait_healthy)   t_wait_healthy "${ARGS[@]}" ;;
     fix_dns)        t_fix_dns ;;
+    set_env)        t_set_env "${ARGS[@]}" ;;
+    fix_template)   t_fix_template_targets "${ARGS[0]}" ;;
     *) echo "unknown tool '$1'"; return 1 ;;
   esac
 }
@@ -392,11 +535,14 @@ Tools:
   wait_healthy NAME SECONDS   for the main immich container this also requires its web UI to answer
   fix_dns             put the stack on a user-defined network with aliases matching the
                       DB_HOSTNAME/REDIS_HOSTNAME env of immich, restart it, wait for its web UI
+  set_env NAME K V    recreate NAME with env K=V, keeping every mount and port; health-gated
+  fix_template NAME   repair template variables whose label and env var name disagree
 Rules:
 - Common Immich failures: config drift (live container missing/wrong REDIS_HOSTNAME or DB_HOSTNAME), template fixed but container never recreated, containers split across docker networks, a container stopped or restarting-looping from bad env, disk full.
 - Investigate with inspect/logs/template/net_test BEFORE acting. One action per turn. Never repeat an action that already failed the same way.
 - patch_template BEFORE recreate — recreate builds the container FROM the template.
-- If STATE says a template is MISSING, the stack is compose-managed: patch_template and recreate CANNOT work on it. Do not try them. Use fix_dns, start/restart, exec and logs, and if the fix needs a compose-file edit, report it.
+- STATE lists each template variable as "LABEL = value", or as "LABEL -> sets env 'X'" when the template label and the env var it actually sets disagree. A mismatch means the container never receives LABEL at all. fix_template NAME repairs that; set_env NAME KEY VALUE heals the running container now. Both were already attempted for DB_HOSTNAME and REDIS_HOSTNAME before you were called.
+- If STATE says a template was not found, that container is compose-managed: patch_template, fix_template and recreate cannot work on it. Use fix_dns, set_env, start/restart, exec and logs.
 - Containers on the default bridge network cannot resolve each other by name at all, whatever the env says. That is what fix_dns repairs, and it was already attempted once before you were called.
 - A container that merely stopped: start it. Recreate only to apply a config fix.
 - If several containers need recreating: postgres first, then redis, then machine-learning, then immich LAST.
@@ -448,8 +594,19 @@ if [ "$CODE" = 200 ] || [ "$CODE" = 302 ]; then
   healthy_exit "$CODE" "Nothing to fix — your photos should load normally. You can close this window."
 fi
 
-# --- deterministic floor: the default-bridge name-resolution fix, before the model
+# --- deterministic floor: repairs we can make without asking the model
 MAIN=$(pick_main)
+
+if [ -n "$MAIN" ] && { [ -z "$(env_of "$MAIN" REDIS_HOSTNAME)" ] || [ -z "$(env_of "$MAIN" DB_HOSTNAME)" ]; }; then
+  say "Immich is missing a setting it needs to find its database or cache. Fixing that first..."
+  ENVOUT=$(t_fix_env "$MAIN" 2>&1); printf '%s\n' "$ENVOUT"
+  printf '===== floor: fix_env =====\n%s\n' "$ENVOUT" >>"$EP"
+  CODE=$(web_code)
+  if [ "$CODE" = 200 ] || [ "$CODE" = 302 ]; then
+    healthy_exit "$CODE" "Fixed: Immich was missing the address of its database or cache. Photos should load now."
+  fi
+fi
+
 if [ -n "$MAIN" ] && nets_of "$MAIN" | grep -qw bridge; then
   say "Immich is not answering and its containers are on Unraid's default network,"
   say "which cannot look each other up by name. Fixing that first..."
