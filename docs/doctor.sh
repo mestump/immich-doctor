@@ -1,246 +1,452 @@
 #!/usr/bin/env bash
-# Immich doctor v4 — diagnose + AI-repair loop for an Immich stack on Unraid.
-# Usage (as root in the Unraid web terminal) — no key needed, it self-fetches:
-#   curl -fsSL https://mestump.github.io/immich-doctor/doctor.sh | bash
-# Or pass a key explicitly:  ... | bash -s -- sk-...
-# Optional: prefix PUBLIC_URL=http://<tailscale-ip-or-host>:2283 to also verify
-# the URL you actually use (e.g. over Tailscale). Without it, only local checks run.
+# immich-doctor v5 — an agent, delivered by one line of curl.
 #
-# Loop: gather -> Spark assesses -> apply safe fixes -> re-verify. Repeats up to
-# MAX_ROUNDS (default 3) with fresh evidence each round, until Immich answers or
-# the remaining fix genuinely needs a human hand (Unraid GUI edit).
+#   curl -fsSL https://mestump.github.io/immich-doctor/doctor.sh | bash
+#
+# Runs ON the Unraid box as root (the Unraid web terminal already is).
+# Investigates the whole Immich stack (server + redis + postgres + ML), then
+# ACTS: patches dockerMan templates, recreates containers faithfully from the
+# template, restarts services, gates every mutation on health checks with
+# automatic rollback, and reports in plain English. Full transcript uploaded
+# so Mike can review after the fact.
+#
+# The brain is Spark (reasoning LLM) on the plexivision gateway, with retries
+# and a direct-tailscale fallback. The model only emits one tool call per
+# turn; this script executes it deterministically and keeps the evidence.
+#
+# Env overrides: API_KEY, API_URL, API_FALLBACK_URL, MODEL, PUBLIC_URL,
+# MAX_ROUNDS, DOCTOR_WEBHOOK=discord-webhook, DRYRUN=1, DOCTOR_LIB=1 (functions only).
 
-API_KEY="${1:-}"
+[ "${DOCTOR_LIB:-0}" = 1 ] || [ "$(id -u)" = 0 ] || { echo "run as root (Unraid web terminal is)"; exit 2; }
+export PATH=/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin:$PATH
 API_URL="${API_URL:-https://llm.plexivision.tv/v1/chat/completions}"
+API_FALLBACK_URL="${API_FALLBACK_URL:-http://10.44.0.2:8080/v1/chat/completions}"
 MODEL="${MODEL:-spark-prod}"
-PUBLIC_URL="${PUBLIC_URL:-}"      # e.g. http://100.x.y.z:2283 — verified only if set
-MAX_ROUNDS="${MAX_ROUNDS:-3}"
-HEAL_WAIT="${HEAL_WAIT:-120}"     # seconds to wait for Immich to come up after fixes
-
-# Self-fetch the key when not passed as an argument (Pages ships doctor-key.txt).
-if [ -z "${API_KEY:-}" ]; then
-  for cand in "$(dirname "${BASH_SOURCE[0]:-$0}")/doctor-key.txt" ./doctor-key.txt /tmp/doctor-key.txt; do
-    if [ -f "$cand" ]; then API_KEY="$(tr -d '[:space:]' < "$cand")"; break; fi
-  done
-  if [ -z "${API_KEY:-}" ]; then
-    API_KEY="$(curl -fsSL -m 15 "${DOCTOR_BASE:-https://mestump.github.io/immich-doctor}/doctor-key.txt" 2>/dev/null | tr -d '[:space:]' || true)"
-  fi
-fi
-if [ -z "${API_KEY:-}" ]; then echo "no API key (arg, doctor-key.txt, or download). ask Mike." >&2; exit 2; fi
+MAX_ROUNDS="${MAX_ROUNDS:-8}"
+WEB_URL="${PUBLIC_URL:-http://127.0.0.1:2283/}"
+CFG="${CFG:-/boot/config/docker.cfg}"
+BAK="${BAK:-/root/immich-doctor-backups}"
+TS=$(date +%Y%m%d-%H%M%S)
+mkdir -p "$BAK"
 
 say() { printf '\033[1;34m[doctor]\033[0m %s\n' "$*"; }
 ok()  { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 bad() { printf '\033[1;31m[fail]\033[0m %s\n' "$*"; }
+warn(){ printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 
-exfil_bundle() { # $1 = bundle path — push evidence somewhere we can read it
+if [ "${DOCTOR_LIB:-0}" = 1 ]; then
+  # lib mode: no keys, no side effects — for offline unit testing of tools
+  :
+else
+  API_KEY="${1:-${API_KEY:-}}"
+  [ -n "$API_KEY" ] || for cand in "$(dirname "${BASH_SOURCE[0]:-$0}")/doctor-key.txt" ./doctor-key.txt /tmp/doctor-key.txt; do
+    [ -s "$cand" ] && { API_KEY=$(tr -d '[:space:]' < "$cand"); break; }
+  done
+  [ -n "${API_KEY:-}" ] || API_KEY=$(curl -fsSL "https://mestump.github.io/immich-doctor/doctor-key.txt?v=$RANDOM" 2>/dev/null | tr -d '[:space:]')
+  [ -n "$API_KEY" ] || { echo "no API key — ask Mike."; exit 2; }
+  command -v docker >/dev/null 2>&1 || { echo "docker not found — is Docker enabled in Unraid Settings?"; exit 2; }
+fi
+command -v jq >/dev/null 2>&1 || { echo "jq missing (odd on Unraid 6.12+)"; exit 2; }
+
+TMP="$(mktemp -d /tmp/immich-agent.XXXX)"
+trap 'rm -rf "$TMP"' EXIT
+EP="$TMP/episodes.txt"; : >"$EP"
+
+# ------------------------------------------------------------- evidence glue
+exfil_bundle() {
   local b="$1" url
-  # Optional Discord webhook ping (set DOCTOR_WEBHOOK to a channel webhook URL).
   [ -n "${DOCTOR_WEBHOOK:-}" ] && curl -s -m 15 -X POST -H 'Content-Type: application/json' \
-    -d "{\"content\":\"immich-doctor stuck on $(hostname). bundle: see paste URL printed on his terminal\"}" \
+    -d "{\"content\":\"immich-doctor finished on $(hostname). transcript: see paste URL on his terminal\"}" \
     "$DOCTOR_WEBHOOK" >/dev/null 2>&1
   url=$(curl -s -m 30 -A "immich-doctor/1.0 (diagnostic bundle upload)" \
     -F "reqtype=fileupload" -F "fileToUpload=@${b}" https://catbox.moe/user/api.php 2>/dev/null | grep -oE 'https://files\.catbox\.moe/[^ ]+' | head -1)
-  if [ -z "$url" ]; then
-    url=$(curl -s -m 30 -A "immich-doctor/1.0" -F "file=@${b}" https://tmpfiles.org/api/v1/upload 2>/dev/null | jq -r '.data.url // empty' | sed 's|tmpfiles.org/|tmpfiles.org/dl/|')
-  fi
+  [ -n "$url" ] || url=$(curl -s -m 30 -A "immich-doctor/1.0" -F "file=@${b}" https://tmpfiles.org/api/v1/upload 2>/dev/null \
+    | jq -r '.data.url // empty' | sed 's|tmpfiles.org/|tmpfiles.org/dl/|')
   if [ -n "$url" ]; then
-    bad "bundle uploaded: $url   (ask Mike to run: curl -s $url)"
+    ok "transcript uploaded: $url   (tell Mike: curl -s $url)"
     printf '%s\n' "$url" >>/tmp/immich-doctor-uploads.txt
   else
-    bad "upload failed; bundle stays at $b — send it to Mike manually"
+    bad "upload failed; transcript at /tmp/immich-doctor-bundle.txt"
+    cp "$b" /tmp/immich-doctor-bundle.txt
   fi
 }
-TMP="$(mktemp -d /tmp/immich-doctor.XXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
-# ------------------------------------------------------------------ probing
-probe_local() {
-  # echoes the HTTP code of the Immich web UI (or 000). A code alone is not
-  # enough — Unraid's nginx (80/443/8080) and other apps answer 200/302 too;
-  # the page body must actually look like Immich.
-  local p c body ports
-  ports="2283 8080 $(ss -lnt | awk 'NR>1 {split($4,a,":"); print a[length(a)]}' | sort -un | tr '\n' ' ')"
-  for p in $(printf '%s\n' $ports | awk '!seen[$0]++'); do
-    body=$(curl -sL -m 6 "http://127.0.0.1:${p}/" 2>/dev/null | head -c 4000)
-    if printf '%s' "$body" | grep -qi immich; then
-      c=$(curl -sL -m 6 -o /dev/null -w "%{http_code}" "http://127.0.0.1:${p}/" 2>/dev/null)
-      echo "${c:-200}"; return
-    fi
-  done
-  echo 000
+# ------------------------------------------------------------ stack awareness
+stack_names() {
+  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -iE 'immich|redis|postgres' | grep -v -- '-agent-old$'
 }
-
-wait_healthy() { # $1 = seconds to wait
-  local deadline=$((SECONDS + ${1:-30})) code
-  while :; do
-    code=$(probe_local)
-    echo "$code" | grep -qE '^(200|302|307|401)$' && { LAST_CODE="$code"; return 0; }
-    [ $SECONDS -ge $deadline ] && { LAST_CODE="$code"; return 1; }
-    sleep 6
-  done
+pick_main() {
+  local n
+  n=$(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null | awk -F'\t' 'tolower($1)=="immich"{print $1; exit}')
+  [ -n "$n" ] || n=$(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null | awk -F'\t' '$2 ~ /immich-server/ {print $1; exit}')
+  echo "$n"
 }
+ip_of() { docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{if $v.IPAddress}}{{$v.IPAddress}}{{break}}{{end}}{{end}}' "$1" 2>/dev/null; }
 
-# ------------------------------------------------- deterministic safe fixes
-fix_restart_policy() {
-  # immich containers with restart='no' never come back after a crash/reboot
-  local c rp
-  for c in $(docker ps -a --format '{{.Names}}' | grep -i immich); do
-    rp=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$c" 2>/dev/null)
-    if [ "$rp" = "no" ] || [ "$rp" = "none" ]; then
-      say "setting restart policy 'unless-stopped' on $c (was: $rp)"
-      docker update --restart unless-stopped "$c" >/dev/null 2>&1 && ok "$c will now auto-start after crashes/reboots"
-    fi
-  done
+template_block() { # name -> unescaped <container> block (model display)
+  template_raw "$1" | sed 's/&quot;/"/g; s/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g'
 }
-
-# ------------------------------------------------------------------ gather
-gather() { # $1 = bundle path
-  local B="$1"
-  : >"$B"
-  { printf '===== host =====\n'; hostname; cat /etc/unraid-version 2>/dev/null || uname -a; uptime; } >>"$B" 2>&1
-  cap() { local label="$1"; shift; { printf '\n===== %s =====\n' "$label"; "$@" 2>&1 | head -c 2500; printf '\n'; } >>"$B"; }
-  cap "docker ps (immich)" docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
-  cap "docker disk usage" df -h /mnt/user /var/lib/docker 2>/dev/null || true
-  cap "free mem" free -m
-  cap "listeners" ss -lntp
-  cap "local probes" bash -c 'for p in 2283 8080 3001; do
-    printf "port %s: " "$p"
-    curl -s -m 4 -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:${p}/" 2>/dev/null || echo fail
-  done; if [ -n "$1" ]; then curl -s -m 8 -o /dev/null -w "user URL %s\n" "%{http_code}" "$1"; fi' _ "$PUBLIC_URL"
-  local c
-  for c in $(docker ps -a --format '{{.Names}}' | grep -i immich); do
-    cap "inspect $c" docker inspect -f 'restart={{.HostConfig.RestartPolicy.Name}} status={{.State.Status}} started={{.State.StartedAt}} OOM={{.State.OOMKilled}} exitcode={{.State.ExitCode}} network={{range $k,$_ := .NetworkSettings.Networks}}{{$k}} {{end}} env={{range .Config.Env}}{{println .}}{{end}}' "$c" 2>/dev/null \
-      | sed -E 's/(PASSWORD|SECRET|_KEY|TOKEN)=[^ ]*/\1=<redacted>/g' | head -c 1200
-    cap "logs $c (tail60)" docker logs --tail 60 "$c"
-  done
+template_raw() { # name -> RAW <container> block as stored (&quot;-escaped attrs)
+  [ -r "$CFG" ] || return 0
+  awk -v RS='<container>' -v n="$1" 'index($0,"<Name>"n"</Name>"){print "<container>" $0; exit}' "$CFG" 2>/dev/null
 }
+xml_decode() { sed 's/&quot;/"/g; s/&#34;/"/g; s/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g'; }
 
-# ---------------------------------------------------------------- main loop
-LOOP_NEEDED=true
-if wait_healthy 20; then
-  ok "Immich is already answering (HTTP $LAST_CODE)"
-  fix_restart_policy
-  LOOP_NEEDED=false
-else
-  bad "Immich not answering — starting repair loop (max $MAX_ROUNDS rounds)"
-fi
+# --------------------------------------------------------------- state probe
+probe() {
+  local B="$1" n pfx=""
+  case "$WEB_URL" in https://*) pfx=" -k";; esac
+  {
+    echo "== host =="
+    hostname; head -c 60 /etc/unraid-version 2>/dev/null; echo
+    df -h /mnt/cache /mnt/user 2>/dev/null | tail -n +2 | head -4
 
-HISTORY="(this is the first diagnosis; no fixes applied yet)"
-NEEDS_HUMAN=false; HUMAN=""
-ROUND=1
-for ROUND in $(seq 1 "$MAX_ROUNDS"); do
-  [ "$LOOP_NEEDED" = true ] || break
-  if [ "$ROUND" -gt 1 ]; then
-    # a previous round's fix may just need longer to land
-    wait_healthy "$HEAL_WAIT" && break
-  fi
+    echo "== containers =="
+    docker ps -a --format '{{.Names}} | {{.Image}} | {{.Status}}' 2>/dev/null | grep -iE 'immich|redis|postgres' || echo "NONE FOUND"
+    for n in $(stack_names); do
+      echo "-- $n --"
+      docker inspect "$n" 2>/dev/null | jq -r '.[0] | "health=\(.State.Health.Status // "none") running=\(.State.Running) net=\(.NetworkSettings.Networks|keys|join(",")) ip=\([.NetworkSettings.Networks[].IPAddress]|map(select(.!=""))|join(" ")) restart=\(.HostConfig.RestartPolicy.Name) image=\(.Config.Image)"' 2>/dev/null
+      docker inspect "$n" 2>/dev/null | jq -r '.[0].Config.Env[]' | grep -E '^(REDIS_HOSTNAME|DB_|IMMICH_WEB|POSTGRES_|TZ=)' | head -8
+      docker inspect -f '{{range $p,$c := .NetworkSettings.Ports}}{{if $c}}portmap :{{(index $c 0).HostPort}}->{{$p}}
+{{end}}{{end}}' "$n" 2>/dev/null | grep -E '^portmap' | head -5
+      docker inspect "$n" 2>/dev/null | jq -r '.[0].Mounts[]? | "mount \(.Source) -> \(.Destination)"' | head -6
+    done
 
-  BUNDLE="$TMP/bundle.$ROUND.txt"
-  say "round $ROUND: collecting diagnostics..."
-  gather "$BUNDLE"
-
-  say "asking Spark to assess..."
-  PAYLOAD="$TMP/payload.$ROUND.json"
-  jq -n --arg b "$(cat "$BUNDLE")" --arg h "$HISTORY" --arg m "$MODEL" '{
-    model: $m, temperature: 0.2, max_tokens: 1200,
-    chat_template_kwargs: {thinking: false},
-    messages: [
-      {role:"system", content: "You are an Immich-on-Unraid repair agent working in up to 3 rounds. You receive a fresh diagnostic bundle plus the history of what previous rounds tried and whether it worked. Reply with ONLY a JSON object: {\"summary\": one plain-English sentence for a non-technical owner, \"severity\": \"ok|minor|major\", \"fix_commands\": [shell commands a root shell can run right now, non-destructive only: docker start/restart/unpause/update, docker compose up/restart, systemctl restart docker], \"needs_human\": true|false, \"human_note\": exact click-by-click Unraid webGUI instructions if needs_human}. Common Unraid pitfall: a variable was edited in the container TEMPLATE but the container was never recreated, so the RUNNING container still has the old env — that needs needs_human (Docker tab > immich > Edit > Apply > Re-Authorize; data/volumes are not lost). Do NOT repeat a fix_command that history shows already ran without fixing it — change the diagnosis or escalate with needs_human=true."},
-      {role:"user", content: ("PREVIOUS ROUNDS:\n" + $h + "\n\nFRESH BUNDLE:\n" + $b)}
-    ]}' >"$PAYLOAD"
-
-  REPLY=$(curl -sS -m 240 --retry 2 --retry-delay 5 "$API_URL" -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $API_KEY" --data @"$PAYLOAD")
-  echo "$REPLY" >"$TMP/reply.$ROUND.json"
-  # The reply itself must be JSON — if it isn't, the gateway handed us an HTML/HTTP
-  # error page. Abort with evidence instead of looping on garbage.
-  if ! printf '%s' "$REPLY" | jq -e . >/dev/null 2>&1; then
-    bad "gateway reply is not JSON — saving evidence"
-    printf '===== raw gateway reply =====\n%s\n' "$REPLY" | head -c 1000 >>"$BUNDLE"
-    cp "$BUNDLE" /tmp/immich-doctor-bundle.txt
-    bad "ask Mike to check llm.plexivision.tv"
-    exfil_bundle /tmp/immich-doctor-bundle.txt
-    exit 2
-  fi
-  CONTENT=$(echo "$REPLY" | jq -r '(.choices[0].message.content // .choices[0].message.reasoning) // empty' 2>/dev/null)
-  if [ -z "${CONTENT:-}" ]; then
-    bad "API returned an error:"; echo "$REPLY" | jq '.error // .' | head -c 400; echo
-    cp "$BUNDLE" /tmp/immich-doctor-bundle.txt
-    exfil_bundle /tmp/immich-doctor-bundle.txt
-    exit 2
-  fi
-  # Model may wrap the JSON in prose or fences — extract the outermost object.
-  PARSED=""
-  for ATTEMPT in 1 2; do
-    CAND=$(printf '%s' "$CONTENT" | sed -e 's/^```[a-z]*//' -e 's/```$//')
-    OBJ=$(printf '%s' "$CAND" | tr -d '\n'); OBJ="${OBJ#\{}\}"; OBJ="{${OBJ#*\{}\}"; OBJ="${OBJ%\}}"
-    OBJ=$(printf '%s' "$CAND" | awk 'BEGIN{s=0} {n=index($0,"{"); if(n>0&&!s){s=NR; line=$0; sub(/^[^{]*/,"",line); buf=line} else if(s&&!done){buf=buf" "$0} } END{if(s){print buf}}' | sed 's/}[^}]*$/}/')
-    if printf '%s' "$OBJ" | jq -e '.summary' >/dev/null 2>&1; then PARSED="$OBJ"; break; fi
-    if [ "$ATTEMPT" = 1 ]; then
-      say "model reply wasn't valid JSON — re-asking..."
-      REPLY=$(curl -sS -m 240 "$API_URL" -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $API_KEY" --data @"$PAYLOAD")
-      CONTENT=$(echo "$REPLY" | jq -r '(.choices[0].message.content // .choices[0].message.reasoning) // empty' 2>/dev/null)
-    fi
-  done
-  if [ -z "$PARSED" ]; then
-    printf '===== unparseable model reply =====\n%s\n' "$CONTENT" | head -c 1000 >>"$BUNDLE"
-    cp "$BUNDLE" /tmp/immich-doctor-bundle.txt
-    bad "model reply unparseable twice"
-    exfil_bundle /tmp/immich-doctor-bundle.txt
-    exit 2
-  fi
-  CONTENT="$PARSED"
-
-  SUMMARY=$(printf '%s' "$CONTENT" | jq -r '.summary // "?"')
-  SEV=$(printf '%s' "$CONTENT" | jq -r '.severity // "major"')
-  HUMAN=$(printf '%s' "$CONTENT" | jq -r '.human_note // ""')
-  NEEDS_HUMAN=$(printf '%s' "$CONTENT" | jq -r '.needs_human // false')
-  [ "$ROUND" = 1 ] && printf '\n\033[1;36mSPARK SAYS:\033[0m %s\n' "$SUMMARY" || say "round $ROUND assessment: $SUMMARY"
-
-  APPLIED=""
-  if [ "$SEV" != "ok" ]; then
-    while IFS= read -r cmd; do
-      [ -z "$cmd" ] && continue
-      if printf '%s %s' "$APPLIED" "$HISTORY" | grep -qF "$cmd"; then continue; fi
-      if printf '%s' "$cmd" | grep -qE '^\s*(docker (start|restart|unpause|update|compose (up|restart)|container restart)|docker-compose up|systemctl restart docker|/etc/rc\.d/rc\.docker restart)\b'; then
-        say "applying: $cmd"
-        timeout 120 bash -c "$cmd" >>"$TMP/fix.log" 2>&1 && ok "done" || bad "command failed (see /tmp/immich-doctor-fix.log)"
-        APPLIED="${APPLIED};$cmd"
+    echo "== dockerMan templates =="
+    for n in $(stack_names); do
+      blk=$(template_block "$n")
+      if [ -n "$blk" ]; then
+        echo "-- template: $n --"
+        echo "$blk" | grep -E '<(PortMap|Vol |Environment|Network>|Registry|Repository|WebUI|extra_params|AlwaysRestart|Privileged)' | sed 's/^ *//' | head -30
       else
-        bad "refused unsafe command from model: $cmd"
+        echo "-- template: $n MISSING (compose-managed? GUI/dockerman cannot recreate it) --"
       fi
-    done < <(printf '%s' "$CONTENT" | jq -r '.fix_commands[]? // empty')
-  fi
-  fix_restart_policy
-  [ -n "$APPLIED" ] && cp "$TMP/fix.log" /tmp/immich-doctor-fix.log
-  HISTORY="round $ROUND: summary=[$SUMMARY] applied=[${APPLIED:-none}] needs_human=$NEEDS_HUMAN"
+    done
 
-  if [ "$NEEDS_HUMAN" = "true" ]; then
-    # one last grace wait in case the safe fixes alone were enough
-    if wait_healthy 30; then break; fi
-    say "remaining fix needs a human — stopping the loop instead of spinning"
-    break
+    echo "== reachability (from host) =="
+    echo "immich web $WEB_URL ->$(curl $pfx -s -o /dev/null -m 8 -w ' %{http_code}' "$WEB_URL")"
+    for n in $(stack_names); do
+      case "$n" in *redis*) rp=6379;; *postgres*|*pg*|*pgsql*) rp=5432;; *) continue;; esac
+      ip=$(ip_of "$n")
+      [ -n "$ip" ] && { timeout 5 bash -c "exec 3<>/dev/tcp/$ip/$rp" 2>/dev/null \
+        && echo "$n tcp $ip:$rp ok" || echo "$n tcp $ip:$rp FAIL"; }
+    done
+
+    echo "== last logs =="
+    for n in $(stack_names); do
+      echo "-- $n --"; docker logs --tail 6 "$n" 2>&1 | tail -c 500; echo
+    done
+  } >"$B" 2>&1
+  head -c 6500 "$B" | tr -d '\000' | tr -cd '\11\12\15\40-\176'
+}
+
+# ------------------------------------------------------------------ toolset
+t_exec()  { local n="$1"; shift; docker exec "$n" timeout 30 sh -c "$*" 2>&1 | head -c 2200; }
+t_logs()  { docker logs --tail "${2:-40}" "$1" 2>&1 | tail -c 2200; }
+t_inspect() {
+  if [ "${1:-all}" = all ]; then
+    local n
+    for n in $(stack_names); do
+      echo "== $n =="
+      docker inspect "$n" 2>/dev/null | jq -r '.[0] | "health=\(.State.Health.Status // "none") running=\(.State.Running) started=\(.State.StartedAt)\nimage=\(.Config.Image)\nenv: \([.Config.Env[]|select(test("REDIS|DB_|POSTGRES"))]|join(\" \"))\nnet: \(.NetworkSettings.Networks|keys|join(\",\")) ips: \([.NetworkSettings.Networks[].IPAddress]|join(\" \"))\nports: \([.NetworkSettings.Ports|to_entries[]|select(.value)|\(if (.value|length)>0 then "\(.value[0].HostPort)->\(.key)" else "" end)]|join(\" \"))\nmounts: \([.Mounts[]|"\(.Source)->\(.Destination)"]|join(\"  \"))"' 2>/dev/null
+    done
+  else
+    docker inspect "$1" 2>/dev/null | jq -r '.[0] | "health=\(.State.Health.Status // "none") running=\(.State.Running) image=\(.Config.Image)\n\(.Config.Env[]|select(test("REDIS|DB_|POSTGRES")))\nnet: \(.NetworkSettings.Networks|keys|join(\",\")) ip: \(.NetworkSettings.Networks[keys[0]].IPAddress)\n\([.Mounts[]|"mount \(.Source)->\(.Destination)"]|join(\"\n\"))"'
   fi
+}
+t_template() { local b; b=$(template_block "$1"); [ -n "$b" ] && printf '%s' "$b" | head -c 2200 || echo "no dockerMan template for '$1'"; }
+t_net_test() { # FROM TARGET PORT — host-side probe (busybox lacks /dev/tcp): resolve TARGET container to IP
+  local tgt="$2" ip
+  ip=$(ip_of "$tgt"); [ -n "$ip" ] || ip="$tgt"
+  timeout 5 bash -c "exec 3<>/dev/tcp/$ip/$3" 2>/dev/null && echo "CONNECT_OK $tgt($ip):$3 from host" || echo "CONNECT_FAIL $tgt($ip):$3"
+}
+t_probe_url() { local pfx=""; case "$1" in https://*) pfx=" -k";; esac; curl $pfx -s -o /dev/null -m 8 -w "HTTP %{http_code}" "$1"; }
+t_disk() { df -h /mnt/cache /mnt/user /var/lib/docker 2>/dev/null | tail -n +2; }
+
+t_patch_template() { # name ENV VALUE — XML-quote-aware, backup + integrity gate
+  local name="$1" e="$2" v="$3"
+  [ -r "$CFG" ] || { echo "no $CFG"; return 1; }
+  case "$e" in *[!A-Za-z0-9_]*|'') echo "bad env name"; return 1;; esac
+  case "$v" in *'<'*|*'>'*|*"'"*) echo "value has XML-hostile chars"; return 1;; esac
+  v=$(printf '%s' "$v" | sed 's/&/\&amp;/g')
+  cp "$CFG" "$BAK/docker.cfg.$TS" || return 1
+  # docker.cfg stores templates with &quot;-escaped attribute quotes. Per-container
+  # records (RS=<container>) so a multi-container template patches the RIGHT block.
+  # NOTE: & is literal in awk patterns but means "matched text" in replacements ->
+  # every &quot; in a replacement is written \\&quot;; value's & pre-escaped to \&.
+  awk -v RS='<container>' -v ORS='<container>' -v n="$name" -v e="$e" \
+      -v v="$(printf '%s' "$v" | sed 's/&/\\\&/g')" '
+    NR>1 && index($0, "<Name>" n "</Name>") {
+      if (index($0, "Environment Name=&quot;" e "&quot;")) {
+        sub("Environment Name=&quot;" e "&quot; Usage=&quot;[^&]*&quot; Value=&quot;[^&]*&quot;",
+            "Environment Name=\\&quot;" e "\\&quot; Usage=\\&quot;Required\\&quot; Value=\\&quot;" v "\\&quot;")
+      } else {
+        sub("</DockerTemplateParams>",
+            "<Environment Name=\\&quot;" e "\\&quot; Usage=\\&quot;Required\\&quot; Value=\\&quot;" v "\\&quot;/></DockerTemplateParams>")
+      }
+    }
+    { print }' "$CFG" > "$CFG.new"
+  if [ "$(grep -c '<template>' "$CFG")" = "$(grep -c '<template>' "$CFG.new")" ] \
+     && [ "$(grep -c '</template>' "$CFG")" = "$(grep -c '</template>' "$CFG.new")" ] \
+     && grep -q "Name=&quot;$e&quot;" "$CFG.new"; then
+    mv "$CFG.new" "$CFG"
+    echo "patched template $name: $e=$v (backup: $BAK/docker.cfg.$TS)"
+  else
+    rm -f "$CFG.new"; cp "$BAK/docker.cfg.$TS" "$CFG"
+    echo "PATCH REJECTED (integrity check) — $CFG restored"
+    return 1
+  fi
+}
+
+t_recreate() { # name — rebuild from dockerMan template; rename-rm-run, health gate, rollback
+  local name="$1" blk blkf img repo curi ctag net restart webui shell priv mem xp postargs p hp cp e en ev v vh vc
+  local a ra=() nvolargs nmounts hc pt
+  blk=$(template_raw "$name")
+  [ -n "$blk" ] || { echo "no dockerMan template for $name (compose-managed?) — cannot recreate"; return 1; }
+  blkf="$TMP/tmpl.$name.xml"; printf '%s\n' "$blk" >"$blkf"   # raw: attrs &quot;-escaped, values quote-safe
+
+  img=$(docker inspect -f '{{.Config.Image}}' "$name" 2>/dev/null)
+  if [ -z "$img" ]; then
+    # dockerMan rule: <Registry> set -> lscr.io/<Repository>:<tag>; else Repository is the full path
+    repo=$(sed -n 's:.*<Repository>\(.*\)</Repository>.*:\1:p' "$blkf" | head -1)
+    reg=$(sed -n 's:.*<Registry>\(.*\)</Registry>.*:\1:p' "$blkf" | head -1)
+    ctag=$(sed -n 's:.*<RegistryTag>\(.*\)</RegistryTag>.*:\1:p' "$blkf" | head -1); ctag=${ctag:-latest}
+    if [ -n "$reg" ]; then img="lscr.io/${repo}:${ctag}"; else img="${repo}:${ctag}"; fi
+  fi
+  [ -n "$img" ] || { echo "cannot determine image for $name"; return 1; }
+
+  net=$(sed -n 's:.*<Network>\(.*\)</Network>.*:\1:p' "$blkf" | head -1); net=${net:-bridge}
+  restart=$(grep -q '<AlwaysRestart>yes' "$blkf" && echo unless-stopped || echo no)
+  webui=$(sed -n 's:.*<WebUI>\(.*\)</WebUI>.*:\1:p' "$blkf" | head -1)
+  shell=$(sed -n 's:.*<Shell>\(.*\)</Shell>.*:\1:p' "$blkf" | head -1)
+  priv=$(grep -q '<Privileged>yes' "$blkf" && echo yes || echo no)
+  mem=$(sed -n 's:.*<Memory>\([0-9]*\)</Memory>.*:\1:p' "$blkf" | head -1)
+  xp=$(sed -n 's:.*<extra_params>\(.*\)</extra_params>.*:\1:p' "$blkf" | head -1)
+  postargs=$(sed -n 's:.*<PostArgs>\(.*\)</PostArgs>.*:\1:p' "$blkf" | head -1)
+
+  ra=(--name "$name" --restart="$restart" --network "$net" --label net.unraid.docker.managed=dockerman)
+  [ -n "$webui" ] && ra+=(--label "net.unraid.docker.webui=$webui")
+  [ -n "$shell" ] && ra+=(--label "net.unraid.docker.shell=$shell")
+  [ "$priv" = yes ] && ra+=(--privileged)
+  [ -n "$mem" ] && [ "$mem" != 0 ] && ra+=(--memory "${mem}m")
+
+  while IFS= read -r p; do
+    hp=$(printf '%s' "$p" | sed -n 's:.*host="\([^"]*\)".*:\1:p')
+    cp=$(printf '%s' "$p" | sed -n 's:.*container="\([^"]*\)".*:\1:p')
+    [ -n "$hp" ] && [ -n "$cp" ] && ra+=(-p "$hp:$cp")
+  done < <(grep -oE '<PortMap [^>]*>' "$blkf")
+
+  while IFS= read -r v; do
+    local vh vc
+    vh=$(printf '%s' "$v" | sed -n 's:.*Source="\([^"]*\)".*:\1:p')
+    vc=$(printf '%s' "$v" | sed -n 's:.*Target="\([^"]*\)".*:\1:p')
+    [ -n "$vh" ] && [ -n "$vc" ] && ra+=(-v "$vh:$vc")
+  done < <(grep '<Vol ' "$blkf")
+
+  # Environment attrs are &quot;-escaped in docker.cfg; value is last attr, parse greedy-from-right
+  while IFS= read -r e; do
+    en=$(printf '%s' "$e" | sed -n 's:.*Name=\&quot;\([^&]*\)\&quot;.*:\1:p')
+    ev=$(printf '%s' "$e" | sed -n 's:.*Value=\&quot;\(.*\)\&quot;/\?>:\1:p' | xml_decode)
+    [ -n "$en" ] && ra+=(-e "$en=$ev")
+  done < <(grep -oE '<Environment [^>]*>' "$blkf")
+
+  set -f; for a in $xp; do ra+=("$a"); done; set +f
+
+  # safety: never silently mount nothing when the live container mounts something
+  nmounts=$(docker inspect -f '{{len .Mounts}}' "$name" 2>/dev/null || echo 0)
+  nvolargs=$(printf '%s\n' "${ra[@]}" | grep -cx -- '-v')
+  if [ "${nmounts:-0}" -gt 0 ] && [ "$nvolargs" -eq 0 ]; then
+    echo "REFUSED: template yields 0 mounts but live $name has $nmounts — refusing to risk orphaning data"
+    return 1
+  fi
+  nenvargs=$(printf '%s\n' "${ra[@]}" | grep -cx -- '-e')
+  [ "$nenvargs" -eq 0 ] && { echo "REFUSED: template yields 0 env vars — parse failure"; return 1; }
+
+  hc=$(docker inspect -f '{{if .Config.Healthcheck}}yes{{else}}no{{end}}' "$name" 2>/dev/null || echo no)
+
+  if [ "${DRYRUN:-0}" = 1 ]; then
+    echo "DRYRUN: docker run -d ${ra[*]} $img $postargs"; return 0
+  fi
+
+  docker rename "$name" "${name}-agent-old" 2>/dev/null || true
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  if ! docker run -d "${ra[@]}" "$img" $postargs >/dev/null 2>&1; then
+    docker rename "${name}-agent-old" "$name" 2>/dev/null && docker start "$name" >/dev/null
+    echo "docker run FAILED — rolled back to previous $name"; return 1
+  fi
+
+  local t=0 st final
+  while [ $t -lt 150 ]; do
+    st=$(docker inspect -f '{{.State.Status}}{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$name" 2>/dev/null)
+    case "$st" in runninghealthy) break;; running) [ "$hc" = no ] && break;; esac
+    sleep 5; t=$((t+5))
+  done
+  final=$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}nohc{{end}}' "$name" 2>/dev/null)
+  if [ "$final" = "running healthy" ] || [ "$final" = "running nohc" ]; then
+    docker rm -f "${name}-agent-old" >/dev/null 2>&1
+    echo "recreated $name from template: $final after ${t}s (previous container removed after health gate passed)"
+  else
+    docker rm -f "$name" >/dev/null 2>&1
+    docker rename "${name}-agent-old" "$name" 2>/dev/null && docker start "$name" >/dev/null
+    echo "HEALTH GATE FAILED ($final) — rolled back to previous $name"; return 1
+  fi
+}
+
+t_start()   { docker start "$1"   >/dev/null 2>&1 && echo "started $1"   || echo "start $1 FAILED"; }
+t_stop()    { docker stop "$1"    >/dev/null 2>&1 && echo "stopped $1"   || echo "stop $1 FAILED"; }
+t_restart() { docker restart "$1" >/dev/null 2>&1 && echo "restarted $1" || echo "restart $1 FAILED"; }
+
+t_wait_healthy() { # name seconds
+  local n="$1" lim="${2:-180}" t=0 st
+  while [ $t -lt "$lim" ]; do
+    st=$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}nohc{{end}}' "$n" 2>/dev/null)
+    case "$st" in
+      "running healthy"|"running nohc")
+        if [ "$n" = "$(pick_main)" ]; then
+          local pfx=""; case "$WEB_URL" in https://*) pfx=" -k";; esac
+          local code; code=$(curl $pfx -s -o /dev/null -m 5 -w '%{http_code}' "$WEB_URL")
+          if [ "$code" = 200 ] || [ "$code" = 302 ]; then echo "$n healthy + web $code after ${t}s"; return 0; fi
+        else
+          echo "$n $st after ${t}s"; return 0
+        fi;;
+    esac
+    sleep 5; t=$((t+5))
+  done
+  echo "$n NOT healthy within ${lim}s (last: $st)"; return 1
+}
+
+run_tool() {
+  case "$1" in
+    inspect)        t_inspect "${ARGS[@]:-all}" ;;
+    logs)           t_logs "${ARGS[@]}" ;;
+    template)       t_template "${ARGS[0]}" ;;
+    exec)           t_exec "${ARGS[@]}" ;;
+    net_test)       t_net_test "${ARGS[@]}" ;;
+    probe_url)      t_probe_url "${ARGS[@]}" ;;
+    disk)           t_disk ;;
+    state)          probe "$TMP/bundle.probe.txt" ;;
+    patch_template) t_patch_template "${ARGS[@]}" ;;
+    recreate)       t_recreate "${ARGS[@]}" ;;
+    start)          t_start "${ARGS[@]}" ;;
+    stop)           t_stop "${ARGS[@]}" ;;
+    restart)        t_restart "${ARGS[@]}" ;;
+    wait_healthy)   t_wait_healthy "${ARGS[@]}" ;;
+    *) echo "unknown tool '$1'"; return 1 ;;
+  esac
+}
+
+if [ "${DOCTOR_LIB:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
+
+# ------------------------------------------------------------------ the brain
+SYS='You are Immich-Diagnostician, an agent that repairs an Immich photo-server stack (server + redis + postgres, sometimes machine-learning) on an Unraid box. You cannot touch the machine. Each turn you receive a STATE probe of the box plus RESULTS of your prior actions, and you emit EXACTLY ONE JSON object and nothing else: {"thought":"one line","tool":"NAME","args":["a1","a2"]}
+Tools:
+  inspect all|NAME    condensed docker state of the stack
+  logs NAME [N]       last N log lines of a container
+  template NAME       dockerMan XML template for NAME
+  exec NAME "CMD"     read-only shell inside a container (busybox sh, 30s)
+  net_test FROM TARGET PORT   TCP reachability probe from the host to TARGET container/IP
+  probe_url URL       HTTP status of a URL
+  disk                disk free
+  state               fresh probe of everything
+  patch_template NAME ENV VALUE   add/replace one env var in the XML template (backup + integrity gate)
+  recreate NAME       rebuild container from its XML template (health-gated, auto-rollback)
+  start NAME / stop NAME / restart NAME
+  wait_healthy NAME SECONDS   for the main immich container this also requires its web UI to answer
+Rules:
+- Common Immich failures: config drift (live container missing/wrong REDIS_HOSTNAME or DB_HOSTNAME), template fixed but container never recreated, containers split across docker networks, a container stopped or restarting-looping from bad env, disk full.
+- Investigate with inspect/logs/template/net_test BEFORE acting. One action per turn. Never repeat an action that already failed the same way.
+- patch_template BEFORE recreate — recreate builds the container FROM the template.
+- A container that merely stopped: start it. Recreate only to apply a config fix.
+- If several containers need recreating: postgres first, then redis, then machine-learning, then immich LAST.
+- After recreating the main immich container, finish with wait_healthy immich 180.
+- postgres holds the photo metadata DB: before recreating it, note its mounts and prefer restart over recreate unless its config/template demands a recreate.
+- If the only fix left needs the Unraid GUI (e.g. change a port mapping), say so in the report.
+- When the stack is healthy — or when you are done trying — emit: {"thought":"...","tool":"report","args":["short plain-English summary for the owner: what was wrong, what you changed, what to check next"]}'
+
+ask_spark() { # $1 = state-file
+  local sf="$1" body="$TMP/req.json" tries
+  [ -s "$TMP/state.old" ] && mv "$TMP/state.old" "$TMP/state.prev"
+  [ -s "$TMP/state.cur" ] && mv "$TMP/state.cur" "$TMP/state.old"
+  tr -cd '\11\12\15\40-\176' <"$sf" >"$TMP/state.cur"
+  jq -n --arg sys "$SYS" --arg st "$(cat "$TMP/state.cur")" --arg ep "$(tail -c 9000 "$EP" 2>/dev/null)" \
+        --arg m "$MODEL" \
+    '{model:$m, temperature:0.2, max_tokens:1200, chat_template_kwargs:{thinking:false},
+      messages:[{role:"system",content:$sys},
+                {role:"user",content:("STATE:\n"+$st+"\n\nRESULTS SO FAR:\n"+$ep+"\n\nNext action as one JSON object.")}]}' >"$body"
+  REPLY=""
+  for tries in "$API_URL" "$API_FALLBACK_URL" "$API_URL" "$API_FALLBACK_URL"; do
+    REPLY=$(curl -sS -m 120 -H "Content-Type: application/json" -H "Authorization: Bearer $API_KEY" \
+      -d @"$body" "$tries" 2>/dev/null)
+    if [ -n "$REPLY" ] && echo "$REPLY" | jq -e '.choices[0]' >/dev/null 2>&1; then break; fi
+    REPLY=""; sleep 3
+  done
+}
+
+# ------------------------------------------------------------------ main loop
+say "immich agent online (model=$MODEL, budget $MAX_ROUNDS actions)"
+STATE=$(probe "$TMP/bundle.txt")
+REPORT=""; ROUND=0
+
+for ROUND in $(seq 1 "$MAX_ROUNDS"); do
+  ask_spark "$TMP/bundle.txt"
+  if [ -z "$REPLY" ]; then
+    bad "LLM gateway unreachable on both routes"
+    { echo "== FINAL STATE =="; cat "$TMP/bundle.txt"; echo; echo "== EPISODES =="; cat "$EP"; } > /tmp/immich-doctor-transcript.txt
+    exfil_bundle /tmp/immich-doctor-transcript.txt
+    exit 2
+  fi
+  CONTENT=$(echo "$REPLY" | jq -r '(.choices[0].message.content // .choices[0].message.reasoning) // empty')
+  PARSED=""
+  if [ -n "${CONTENT:-}" ] && echo "$CONTENT" | jq -e 'type=="object"' >/dev/null 2>&1; then
+    PARSED="$CONTENT"
+  else
+    FLAT=$(printf '%s' "${CONTENT:-}" | tr '\n' ' ')
+    G1=$(printf '%s' "$FLAT" | sed -n 's/.*\({.*\}\).*/\1/p')      # greedy first-{ to last-}
+    G2=$(printf '%s' "$FLAT" | sed -n 's/.*\({[^{}]*\}\).*/\1/p')  # smallest object
+    for cand in "$FLAT" "$G1" "$G2"; do
+      [ -z "$cand" ] && continue
+      if echo "$cand" | jq -e 'type=="object" and has("tool")' >/dev/null 2>&1; then PARSED="$cand"; break; fi
+    done
+  fi
+  if [ -z "$PARSED" ]; then
+    printf '===== round %s: unparseable reply =====\n%s\n' "$ROUND" "$(echo "${CONTENT:-}" | head -c 600)" >>"$EP"
+    say "model reply unparseable — retrying next round"
+    continue
+  fi
+  TOOL=$(echo "$PARSED" | jq -r '.tool // "report"')
+  THOUGHT=$(echo "$PARSED" | jq -r '.thought // ""')
+  mapfile -t ARGS < <(echo "$PARSED" | jq -r '.args[]?' 2>/dev/null)
+  say "round $ROUND: $TOOL ${ARGS[*]} — $THOUGHT"
+
+  if [ "$TOOL" = report ]; then
+    REPORT="${ARGS[0]:-done}"; break
+  fi
+
+  OUT=$(run_tool "$TOOL" 2>&1 | head -c 2200)
+  printf '===== round %s: %s %s =====\n%s\n' "$ROUND" "$TOOL" "${ARGS[*]}" "$OUT" >>"$EP"
+  STATE=$(probe "$TMP/bundle.txt")   # fresh evidence for the next ask
 done
 
-# ------------------------------------------------------------------ verify
-if wait_healthy "$HEAL_WAIT"; then
-  ok "Immich responds locally (HTTP $LAST_CODE)"
-  PCODE=""
-  [ -n "$PUBLIC_URL" ] && PCODE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "$PUBLIC_URL" 2>/dev/null); PCODE=${PCODE:-}
-  if [ -z "$PCODE" ]; then
-    ok "you are done — open the Immich app"
-  elif echo "$PCODE" | grep -qE '^(200|302|307)$'; then
-    ok "your Immich URL works (HTTP $PCODE) — you are done, open the Immich app"
-  else
-    bad "server is up but your URL returned HTTP $PCODE — check Tailscale is connected, then ask Mike"
-    cp "$TMP/bundle.$ROUND.txt" /tmp/immich-doctor-bundle.txt; exfil_bundle /tmp/immich-doctor-bundle.txt; exit 1
-  fi
+# ------------------------------------------------------------------- verdict
+LCODE=$(curl -k -s -o /dev/null -m 8 -w '%{http_code}' "$WEB_URL" 2>/dev/null)
+{
+  echo "===== VERDICT ====="
+  echo "checked $WEB_URL -> HTTP ${LCODE:-000}"
+  [ -n "$REPORT" ] && printf 'agent report: %s\n' "$REPORT"
+  echo; cat "$TMP/bundle.txt"
+  echo; echo "===== EPISODES ====="; cat "$EP"
+} > "$TMP/transcript.txt"
+
+[ -n "$REPORT" ] && printf '\n\033[1mAGENT REPORT:\033[0m %s\n' "$REPORT"
+if [ "$LCODE" = 200 ] || [ "$LCODE" = 302 ]; then
+  ok "Immich answers HTTP $LCODE — done."
+  cp "$TMP/transcript.txt" /tmp/immich-doctor-transcript.txt
+  exfil_bundle /tmp/immich-doctor-transcript.txt
+  exit 0
 else
-  bad "Immich still not answering (HTTP ${LAST_CODE:-000})"
-  [ -n "$HUMAN" ] && printf '\033[1;33mA human needs to help:\033[0m %s\n' "$HUMAN"
-  cp "$TMP/bundle.$ROUND.txt" /tmp/immich-doctor-bundle.txt 2>/dev/null || cp "$TMP"/bundle.*.txt /tmp/immich-doctor-bundle.txt
-  exfil_bundle /tmp/immich-doctor-bundle.txt
+  bad "no verified healthy Immich (HTTP ${LCODE:-000}) after $MAX_ROUNDS actions."
+  warn "Screenshot your terminal for Mike, or read him the upload URL above."
+  cp "$TMP/transcript.txt" /tmp/immich-doctor-transcript.txt
+  exfil_bundle /tmp/immich-doctor-transcript.txt
   exit 1
 fi
