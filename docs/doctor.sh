@@ -11,10 +11,6 @@
 
 [ "${DOCTOR_LIB:-0}" = 1 ] || [ "$(id -u)" = 0 ] || { echo "run as root (Unraid web terminal is)"; exit 2; }
 export PATH=/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin:$PATH
-API_URL="${API_URL:-https://llm.plexivision.tv/v1/chat/completions}"
-API_FALLBACK_URL="${API_FALLBACK_URL:-http://10.44.0.2:8080/v1/chat/completions}"
-MODEL="${MODEL:-spark-prod}"
-MAX_ROUNDS="${MAX_ROUNDS:-8}"
 WEB_URL="${PUBLIC_URL:-http://127.0.0.1:2283/}"
 CFG="${CFG:-/boot/config/docker.cfg}"
 # Real dockerMan templates are one XML file per container here — NOT in docker.cfg,
@@ -506,28 +502,6 @@ t_fix_env() { # main-container-name — ensure DB_HOSTNAME / REDIS_HOSTNAME exis
   return $rc
 }
 
-run_tool() {
-  case "$1" in
-    inspect)        t_inspect "${ARGS[@]:-all}" ;;
-    logs)           t_logs "${ARGS[@]}" ;;
-    template)       t_template "${ARGS[0]}" ;;
-    exec)           t_exec "${ARGS[@]}" ;;
-    net_test)       t_net_test "${ARGS[@]}" ;;
-    probe_url)      t_probe_url "${ARGS[@]}" ;;
-    disk)           t_disk ;;
-    state)          probe "$TMP/bundle.probe.txt" ;;
-    patch_template) t_patch_template "${ARGS[@]}" ;;
-    recreate)       t_recreate "${ARGS[@]}" ;;
-    start)          t_start "${ARGS[@]}" ;;
-    stop)           t_stop "${ARGS[@]}" ;;
-    restart)        t_restart "${ARGS[@]}" ;;
-    wait_healthy)   t_wait_healthy "${ARGS[@]}" ;;
-    fix_dns)        t_fix_dns ;;
-    set_env)        t_set_env "${ARGS[@]}" ;;
-    fix_template)   t_fix_template_targets "${ARGS[0]}" ;;
-    *) echo "unknown tool '$1'"; return 1 ;;
-  esac
-}
 
 # Unhealthy stack → wipe and reinstall. Dad pastes doctor.sh; this is the
 # path that actually works. Sibling file when run from the repo, else fetch.
@@ -547,58 +521,6 @@ run_fresh_install() {
 }
 
 if [ "${DOCTOR_LIB:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
-
-# ------------------------------------------------------------------ the brain
-SYS='You are Immich-Diagnostician, an agent that repairs an Immich photo-server stack (server + redis + postgres, sometimes machine-learning) on an Unraid box. You cannot touch the machine. Each turn you receive a STATE probe of the box plus RESULTS of your prior actions, and you emit EXACTLY ONE JSON object and nothing else: {"thought":"one line","tool":"NAME","args":["a1","a2"]}
-Tools:
-  inspect all|NAME    condensed docker state of the stack
-  logs NAME [N]       last N log lines of a container
-  template NAME       dockerMan XML template for NAME
-  exec NAME "CMD"     read-only shell inside a container (busybox sh, 30s)
-  net_test FROM TARGET PORT   TCP reachability probe from the host to TARGET container/IP
-  probe_url URL       HTTP status of a URL
-  disk                disk free
-  state               fresh probe of everything
-  patch_template NAME ENV VALUE   add/replace one env var in the XML template (backup + integrity gate)
-  recreate NAME       rebuild container from its XML template (health-gated, auto-rollback)
-  start NAME / stop NAME / restart NAME
-  wait_healthy NAME SECONDS   for the main immich container this also requires its web UI to answer
-  fix_dns             put the stack on a user-defined network with aliases matching the
-                      DB_HOSTNAME/REDIS_HOSTNAME env of immich, restart it, wait for its web UI
-  set_env NAME K V    recreate NAME with env K=V, keeping every mount and port; health-gated
-  fix_template NAME   repair template variables whose label and env var name disagree
-Rules:
-- Common Immich failures: config drift (live container missing/wrong REDIS_HOSTNAME or DB_HOSTNAME), template fixed but container never recreated, containers split across docker networks, a container stopped or restarting-looping from bad env, disk full.
-- Investigate with inspect/logs/template/net_test BEFORE acting. One action per turn. Never repeat an action that already failed the same way.
-- patch_template BEFORE recreate — recreate builds the container FROM the template.
-- STATE lists each template variable as "LABEL = value", or as "LABEL -> sets env 'X'" when the template label and the env var it actually sets disagree. A mismatch means the container never receives LABEL at all. fix_template NAME repairs that; set_env NAME KEY VALUE heals the running container now. Both were already attempted for DB_HOSTNAME and REDIS_HOSTNAME before you were called.
-- If STATE says a template was not found, that container is compose-managed: patch_template, fix_template and recreate cannot work on it. Use fix_dns, set_env, start/restart, exec and logs.
-- Containers on the default bridge network cannot resolve each other by name at all, whatever the env says. That is what fix_dns repairs, and it was already attempted once before you were called.
-- A container that merely stopped: start it. Recreate only to apply a config fix.
-- If several containers need recreating: postgres first, then redis, then machine-learning, then immich LAST.
-- After recreating the main immich container, finish with wait_healthy immich 180.
-- postgres holds the photo metadata DB: before recreating it, note its mounts and prefer restart over recreate unless its config/template demands a recreate.
-- If the only fix left needs the Unraid GUI (e.g. change a port mapping), say so in the report.
-- When the stack is healthy — or when you are done trying — emit: {"thought":"...","tool":"report","args":["short plain-English summary for the owner: what was wrong, what you changed, what to check next"]}'
-
-ask_spark() { # $1 = state-file
-  local sf="$1" body="$TMP/req.json" tries
-  [ -s "$TMP/state.old" ] && mv "$TMP/state.old" "$TMP/state.prev"
-  [ -s "$TMP/state.cur" ] && mv "$TMP/state.cur" "$TMP/state.old"
-  tr -cd '\11\12\15\40-\176' <"$sf" >"$TMP/state.cur"
-  jq -n --arg sys "$SYS" --arg st "$(cat "$TMP/state.cur")" --arg ep "$(tail -c 9000 "$EP" 2>/dev/null)" \
-        --arg m "$MODEL" \
-    '{model:$m, temperature:0.2, max_tokens:1200, chat_template_kwargs:{thinking:false,enable_thinking:false},
-      messages:[{role:"system",content:$sys},
-                {role:"user",content:("STATE:\n"+$st+"\n\nRESULTS SO FAR:\n"+$ep+"\n\nNext action as one JSON object.")}]}' >"$body"
-  REPLY=""
-  for tries in "$API_URL" "$API_FALLBACK_URL" "$API_URL" "$API_FALLBACK_URL"; do
-    REPLY=$(curl -sS -m 120 -H "Content-Type: application/json" -H "Authorization: Bearer $API_KEY" \
-      -d @"$body" "$tries" 2>/dev/null)
-    if [ -n "$REPLY" ] && echo "$REPLY" | jq -e '.choices[0]' >/dev/null 2>&1; then break; fi
-    REPLY=""; sleep 3
-  done
-}
 
 # ------------------------------------------------------------------ main loop
 if [ -z "${PUBLIC_URL:-}" ]; then   # ponytail: 2283 is the compose default, not Unraid's
