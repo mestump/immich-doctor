@@ -91,7 +91,7 @@ gather() { # $1 = bundle path
   local c
   for c in $(docker ps -a --format '{{.Names}}' | grep -i immich); do
     cap "inspect $c" docker inspect -f 'restart={{.HostConfig.RestartPolicy.Name}} status={{.State.Status}} started={{.State.StartedAt}} OOM={{.State.OOMKilled}} exitcode={{.State.ExitCode}} network={{range $k,$_ := .NetworkSettings.Networks}}{{$k}} {{end}} env={{range .Config.Env}}{{println .}}{{end}}' "$c" 2>/dev/null \
-      | sed -E 's/(PASSWORD|SECRET|_KEY)=[^ ]*/\1=<redacted>/g'
+      | sed -E 's/(PASSWORD|SECRET|_KEY|TOKEN)=[^ ]*/\1=<redacted>/g' | head -c 1200
     cap "logs $c (tail60)" docker logs --tail 60 "$c"
   done
 }
@@ -133,13 +133,42 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
   REPLY=$(curl -sS -m 240 --retry 2 --retry-delay 5 "$API_URL" -H "Content-Type: application/json" \
     -H "Authorization: Bearer $API_KEY" --data @"$PAYLOAD")
   echo "$REPLY" >"$TMP/reply.$ROUND.json"
+  # The reply itself must be JSON — if it isn't, the gateway handed us an HTML/HTTP
+  # error page. Abort with evidence instead of looping on garbage.
+  if ! printf '%s' "$REPLY" | jq -e . >/dev/null 2>&1; then
+    bad "gateway reply is not JSON — saving evidence"
+    printf '===== raw gateway reply =====\n%s\n' "$REPLY" | head -c 1000 >>"$BUNDLE"
+    cp "$BUNDLE" /tmp/immich-doctor-bundle.txt
+    bad "ask Mike to check llm.plexivision.tv; raw reply kept at /tmp/immich-doctor-bundle.txt"
+    exit 2
+  fi
   CONTENT=$(echo "$REPLY" | jq -r '(.choices[0].message.content // .choices[0].message.reasoning) // empty' 2>/dev/null)
   if [ -z "${CONTENT:-}" ]; then
-    bad "API call failed:"; echo "$REPLY" | head -c 400; echo
+    bad "API returned an error:"; echo "$REPLY" | jq '.error // .' | head -c 400; echo
     bad "bundle saved for a human at /tmp/immich-doctor-bundle.txt"
     cp "$BUNDLE" /tmp/immich-doctor-bundle.txt; exit 2
   fi
-  CONTENT=$(printf '%s' "$CONTENT" | sed -e 's/^```[a-z]*//' -e 's/```$//')
+  # Model may wrap the JSON in prose or fences — extract the outermost object.
+  PARSED=""
+  for ATTEMPT in 1 2; do
+    CAND=$(printf '%s' "$CONTENT" | sed -e 's/^```[a-z]*//' -e 's/```$//')
+    OBJ=$(printf '%s' "$CAND" | tr -d '\n'); OBJ="${OBJ#\{}\}"; OBJ="{${OBJ#*\{}\}"; OBJ="${OBJ%\}}"
+    OBJ=$(printf '%s' "$CAND" | awk 'BEGIN{s=0} {n=index($0,"{"); if(n>0&&!s){s=NR; line=$0; sub(/^[^{]*/,"",line); buf=line} else if(s&&!done){buf=buf" "$0} } END{if(s){print buf}}' | sed 's/}[^}]*$/}/')
+    if printf '%s' "$OBJ" | jq -e '.summary' >/dev/null 2>&1; then PARSED="$OBJ"; break; fi
+    if [ "$ATTEMPT" = 1 ]; then
+      say "model reply wasn't valid JSON — re-asking..."
+      REPLY=$(curl -sS -m 240 "$API_URL" -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $API_KEY" --data @"$PAYLOAD")
+      CONTENT=$(echo "$REPLY" | jq -r '(.choices[0].message.content // .choices[0].message.reasoning) // empty' 2>/dev/null)
+    fi
+  done
+  if [ -z "$PARSED" ]; then
+    printf '===== unparseable model reply =====\n%s\n' "$CONTENT" | head -c 1000 >>"$BUNDLE"
+    cp "$BUNDLE" /tmp/immich-doctor-bundle.txt
+    bad "model reply unparseable twice — bundle saved to /tmp/immich-doctor-bundle.txt, send it to Mike"
+    exit 2
+  fi
+  CONTENT="$PARSED"
 
   SUMMARY=$(printf '%s' "$CONTENT" | jq -r '.summary // "?"')
   SEV=$(printf '%s' "$CONTENT" | jq -r '.severity // "major"')
