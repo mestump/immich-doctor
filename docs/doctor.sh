@@ -134,7 +134,7 @@ probe() {
 
     echo "== last logs =="
     for n in $(stack_names); do
-      echo "-- $n --"; docker logs --tail 6 "$n" 2>&1 | tail -c 500; echo
+      echo "-- $n --"; docker logs --tail 6 "$n" 2>&1 | cut -c1-300; echo   # ponytail: no tail -c, busybox tail reads the count as a filename
     done
   } >"$B" 2>&1
   head -c 6500 "$B" | tr -d '\000' | tr -cd '\11\12\15\40-\176'
@@ -142,7 +142,7 @@ probe() {
 
 # ------------------------------------------------------------------ toolset
 t_exec()  { local n="$1"; shift; docker exec "$n" timeout 30 sh -c "$*" 2>&1 | head -c 2200; }
-t_logs()  { docker logs --tail "${2:-40}" "$1" 2>&1 | tail -c 2200; }
+t_logs()  { docker logs --tail "${2:-40}" "$1" 2>&1 | cut -c1-300 | tail -n 60; }
 t_inspect() {
   if [ "${1:-all}" = all ]; then
     local n
@@ -370,7 +370,7 @@ ask_spark() { # $1 = state-file
   tr -cd '\11\12\15\40-\176' <"$sf" >"$TMP/state.cur"
   jq -n --arg sys "$SYS" --arg st "$(cat "$TMP/state.cur")" --arg ep "$(tail -c 9000 "$EP" 2>/dev/null)" \
         --arg m "$MODEL" \
-    '{model:$m, temperature:0.2, max_tokens:1200, chat_template_kwargs:{thinking:false},
+    '{model:$m, temperature:0.2, max_tokens:1200, chat_template_kwargs:{thinking:false,enable_thinking:false},
       messages:[{role:"system",content:$sys},
                 {role:"user",content:("STATE:\n"+$st+"\n\nRESULTS SO FAR:\n"+$ep+"\n\nNext action as one JSON object.")}]}' >"$body"
   REPLY=""
@@ -383,7 +383,14 @@ ask_spark() { # $1 = state-file
 }
 
 # ------------------------------------------------------------------ main loop
-say "immich agent online (model=$MODEL, budget $MAX_ROUNDS actions)"
+if [ -z "${PUBLIC_URL:-}" ]; then   # ponytail: 2283 is the compose default, not Unraid's
+  for n in $(stack_names); do
+    case "$n" in *redis*|*ostgre*|*machine*) continue;; esac
+    hp=$(docker port "$n" 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1)
+    [ -n "$hp" ] && { WEB_URL="http://127.0.0.1:$hp/"; break; }
+  done
+fi
+say "immich agent online (model=$MODEL, budget $MAX_ROUNDS actions, web $WEB_URL)"
 STATE=$(probe "$TMP/bundle.txt")
 REPORT=""; ROUND=0
 
@@ -395,21 +402,24 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
     exfil_bundle /tmp/immich-doctor-transcript.txt
     exit 2
   fi
-  CONTENT=$(echo "$REPLY" | jq -r '(.choices[0].message.content // .choices[0].message.reasoning) // empty')
+  # ponytail: content AND reasoning are both candidates. jq's // keeps "" (truthy),
+  # so `content // reasoning` never fired when the model returned an empty content.
+  CONTENT=$(echo "$REPLY" | jq -r '.choices[0].message.content // empty')
+  RSN=$(echo "$REPLY" | jq -r '.choices[0].message.reasoning // empty')
   PARSED=""
-  if [ -n "${CONTENT:-}" ] && echo "$CONTENT" | jq -e 'type=="object"' >/dev/null 2>&1; then
-    PARSED="$CONTENT"
-  else
-    FLAT=$(printf '%s' "${CONTENT:-}" | tr '\n' ' ')
+  for src in "${CONTENT:-}" "${RSN:-}"; do
+    [ -z "${src//[[:space:]]/}" ] && continue
+    FLAT=$(printf '%s' "$src" | tr '\n' ' ')
     G1=$(printf '%s' "$FLAT" | sed -n 's/.*\({.*\}\).*/\1/p')      # greedy first-{ to last-}
     G2=$(printf '%s' "$FLAT" | sed -n 's/.*\({[^{}]*\}\).*/\1/p')  # smallest object
     for cand in "$FLAT" "$G1" "$G2"; do
       [ -z "$cand" ] && continue
       if echo "$cand" | jq -e 'type=="object" and has("tool")' >/dev/null 2>&1; then PARSED="$cand"; break; fi
     done
-  fi
+    [ -n "$PARSED" ] && break
+  done
   if [ -z "$PARSED" ]; then
-    printf '===== round %s: unparseable reply =====\n%s\n' "$ROUND" "$(echo "${CONTENT:-}" | head -c 600)" >>"$EP"
+    printf '===== round %s: unparseable reply =====\n%s\n' "$ROUND" "$(echo "${CONTENT:-}${RSN:-}" | head -c 600)" >>"$EP"
     say "model reply unparseable — retrying next round"
     continue
   fi
