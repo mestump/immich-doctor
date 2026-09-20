@@ -31,6 +31,21 @@ if [ -z "${API_KEY:-}" ]; then echo "no API key (arg, doctor-key.txt, or downloa
 say() { printf '\033[1;34m[doctor]\033[0m %s\n' "$*"; }
 ok()  { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 bad() { printf '\033[1;31m[fail]\033[0m %s\n' "$*"; }
+
+exfil_bundle() { # $1 = bundle path — push evidence somewhere we can read it
+  local b="$1" url
+  # Optional Discord webhook ping (set DOCTOR_WEBHOOK to a channel webhook URL).
+  [ -n "${DOCTOR_WEBHOOK:-}" ] && curl -s -m 15 -X POST -H 'Content-Type: application/json' \
+    -d "{\"content\":\"immich-doctor stuck on $(hostname). bundle: see paste URL printed on his terminal\"}" \
+    "$DOCTOR_WEBHOOK" >/dev/null 2>&1
+  url=$(curl -s -m 30 -F "file=@${b}" -F "expires=720" https://0x0.st 2>/dev/null | grep -oE 'https://[^ ]+' | head -1)
+  if [ -n "$url" ]; then
+    bad "bundle uploaded: $url   (ask Mike to run: curl -s $url)"
+    printf '%s\n' "$url" >>/tmp/immich-doctor-uploads.txt
+  else
+    bad "upload failed; bundle stays at $b — send it to Mike manually"
+  fi
+}
 TMP="$(mktemp -d /tmp/immich-doctor.XXXX)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -139,14 +154,16 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
     bad "gateway reply is not JSON — saving evidence"
     printf '===== raw gateway reply =====\n%s\n' "$REPLY" | head -c 1000 >>"$BUNDLE"
     cp "$BUNDLE" /tmp/immich-doctor-bundle.txt
-    bad "ask Mike to check llm.plexivision.tv; raw reply kept at /tmp/immich-doctor-bundle.txt"
+    bad "ask Mike to check llm.plexivision.tv"
+    exfil_bundle /tmp/immich-doctor-bundle.txt
     exit 2
   fi
   CONTENT=$(echo "$REPLY" | jq -r '(.choices[0].message.content // .choices[0].message.reasoning) // empty' 2>/dev/null)
   if [ -z "${CONTENT:-}" ]; then
     bad "API returned an error:"; echo "$REPLY" | jq '.error // .' | head -c 400; echo
-    bad "bundle saved for a human at /tmp/immich-doctor-bundle.txt"
-    cp "$BUNDLE" /tmp/immich-doctor-bundle.txt; exit 2
+    cp "$BUNDLE" /tmp/immich-doctor-bundle.txt
+    exfil_bundle /tmp/immich-doctor-bundle.txt
+    exit 2
   fi
   # Model may wrap the JSON in prose or fences — extract the outermost object.
   PARSED=""
@@ -165,7 +182,8 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
   if [ -z "$PARSED" ]; then
     printf '===== unparseable model reply =====\n%s\n' "$CONTENT" | head -c 1000 >>"$BUNDLE"
     cp "$BUNDLE" /tmp/immich-doctor-bundle.txt
-    bad "model reply unparseable twice — bundle saved to /tmp/immich-doctor-bundle.txt, send it to Mike"
+    bad "model reply unparseable twice"
+    exfil_bundle /tmp/immich-doctor-bundle.txt
     exit 2
   fi
   CONTENT="$PARSED"
@@ -213,12 +231,12 @@ if wait_healthy "$HEAL_WAIT"; then
     ok "your Immich URL works (HTTP $PCODE) — you are done, open the Immich app"
   else
     bad "server is up but your URL returned HTTP $PCODE — check Tailscale is connected, then ask Mike"
-    cp "$TMP/bundle.$ROUND.txt" /tmp/immich-doctor-bundle.txt; exit 1
+    cp "$TMP/bundle.$ROUND.txt" /tmp/immich-doctor-bundle.txt; exfil_bundle /tmp/immich-doctor-bundle.txt; exit 1
   fi
 else
   bad "Immich still not answering (HTTP ${LAST_CODE:-000})"
   [ -n "$HUMAN" ] && printf '\033[1;33mA human needs to help:\033[0m %s\n' "$HUMAN"
   cp "$TMP/bundle.$ROUND.txt" /tmp/immich-doctor-bundle.txt 2>/dev/null || cp "$TMP"/bundle.*.txt /tmp/immich-doctor-bundle.txt
-  say "bundle saved to /tmp/immich-doctor-bundle.txt — send it to Mike"
+  exfil_bundle /tmp/immich-doctor-bundle.txt
   exit 1
 fi
