@@ -38,7 +38,11 @@ exfil_bundle() { # $1 = bundle path — push evidence somewhere we can read it
   [ -n "${DOCTOR_WEBHOOK:-}" ] && curl -s -m 15 -X POST -H 'Content-Type: application/json' \
     -d "{\"content\":\"immich-doctor stuck on $(hostname). bundle: see paste URL printed on his terminal\"}" \
     "$DOCTOR_WEBHOOK" >/dev/null 2>&1
-  url=$(curl -s -m 30 -F "file=@${b}" -F "expires=720" https://0x0.st 2>/dev/null | grep -oE 'https://[^ ]+' | head -1)
+  url=$(curl -s -m 30 -A "immich-doctor/1.0 (diagnostic bundle upload)" \
+    -F "reqtype=fileupload" -F "fileToUpload=@${b}" https://catbox.moe/user/api.php 2>/dev/null | grep -oE 'https://files\.catbox\.moe/[^ ]+' | head -1)
+  if [ -z "$url" ]; then
+    url=$(curl -s -m 30 -A "immich-doctor/1.0" -F "file=@${b}" https://tmpfiles.org/api/v1/upload 2>/dev/null | jq -r '.data.url // empty' | sed 's|tmpfiles.org/|tmpfiles.org/dl/|')
+  fi
   if [ -n "$url" ]; then
     bad "bundle uploaded: $url   (ask Mike to run: curl -s $url)"
     printf '%s\n' "$url" >>/tmp/immich-doctor-uploads.txt
