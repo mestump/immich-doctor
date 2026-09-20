@@ -108,6 +108,7 @@ template_vars() { # name -> "LABEL -> ENVVAR = value" per Variable, flagging mis
     tgt=$(printf '%s' "$c" | sed -n 's:.*Target="\([^"]*\)".*:\1:p')
     val=$(printf '%s' "$c" | sed -n 's:.*>\(.*\)$:\1:p')
     [ -n "$lbl" ] || continue
+    case "$lbl" in *[!A-Z0-9_]*|"") echo "  $lbl = $val"; continue;; esac
     if [ "$lbl" != "$tgt" ]; then
       echo "  $lbl -> sets env '$tgt' = $val   <<< MISMATCH: immich will never see $lbl"
     else
@@ -393,6 +394,18 @@ ARG_JQ='.[0] as $c | ($ic[0][0].Config // {}) as $d |
 
 compose_file_of() { docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$1" 2>/dev/null | grep -v '^<no value>$'; }
 
+# Put the -agent-old copy back. Safe to call any time: it is a no-op when there is no
+# copy to restore, and it always removes the failed container first so the rename cannot
+# lose to a name collision the way the old rollback did.
+restore_old() { # name
+  local n="$1"
+  docker inspect "${n}-agent-old" >/dev/null 2>&1 || return 1
+  docker rm -f "$n" >/dev/null 2>&1 || true
+  docker rename "${n}-agent-old" "$n" >/dev/null 2>&1 || { echo "  could not restore ${n}-agent-old"; return 1; }
+  docker start "$n" >/dev/null 2>&1
+  return 0
+}
+
 t_fix_template_targets() { # name — repair Config entries whose Target is not the env var the label names
   local f bk n=0 lbl tgt c
   f=$(template_file "$1"); [ -n "$f" ] || { echo "no template for $1"; return 1; }
@@ -412,7 +425,7 @@ t_fix_template_targets() { # name — repair Config entries whose Target is not 
 }
 
 t_set_env() { # NAME KEY VALUE
-  local name="$1" key="$2" val="$3" img cj ij args=() hc final t=0 st nm nv
+  local name="$1" key="$2" val="$3" img cj ij args=() hc final t=0 st nm nv np err
   [ -n "$name" ] && [ -n "$key" ] || { echo "usage: set_env NAME KEY VALUE"; return 1; }
   cj="$TMP/insp.$name.json"; ij="$TMP/img.$name.json"
   docker inspect "$name" >"$cj" 2>/dev/null || { echo "no container named $name"; return 1; }
@@ -429,11 +442,20 @@ t_set_env() { # NAME KEY VALUE
   if [ "${DRYRUN:-0}" = 1 ]; then printf "DRYRUN: docker run -d"; printf " %q" "${args[@]}"; printf " %s\n" "$img"; return 0; fi
 
   hc=$(jq -r 'if .[0].Config.Healthcheck then "yes" else "no" end' "$cj")
-  docker rename "$name" "${name}-agent-old" >/dev/null 2>&1 || true
-  docker rm -f "$name" >/dev/null 2>&1 || true
-  if ! docker run -d "${args[@]}" "$img" >/dev/null 2>&1; then
-    docker rename "${name}-agent-old" "$name" >/dev/null 2>&1 && docker start "$name" >/dev/null 2>&1
-    echo "docker run FAILED — rolled back to previous $name"; return 1
+  # The old container is the rollback copy, so the rename MUST succeed before anything
+  # is removed. Previously an `|| true` here was followed by an unconditional rm -f,
+  # which deleted the only good container whenever the -agent-old name was taken.
+  docker rm -f "${name}-agent-old" >/dev/null 2>&1 || true
+  docker rename "$name" "${name}-agent-old" >/dev/null 2>&1 \
+    || { echo "could not set $name aside — refusing to recreate"; return 1; }
+  # It is renamed, not stopped, so it still holds the published host ports and the new
+  # container cannot bind them. restore_old starts it again if we have to roll back.
+  docker stop "${name}-agent-old" >/dev/null 2>&1 || true
+  if ! err=$(docker run -d "${args[@]}" "$img" 2>&1 >/dev/null); then
+    restore_old "$name"
+    echo "docker run FAILED — rolled back to previous $name"
+    [ -n "$err" ] && echo "  docker said: $err"
+    return 1
   fi
   while [ $t -lt 120 ]; do
     st=$(docker inspect -f "{{.State.Status}}{{if .State.Health}}{{.State.Health.Status}}{{end}}" "$name" 2>/dev/null)
@@ -441,12 +463,17 @@ t_set_env() { # NAME KEY VALUE
     sleep 5; t=$((t+5))
   done
   final=$(docker inspect -f "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}nohc{{end}}" "$name" 2>/dev/null)
+  # docker run can half-succeed: the container exists and runs, but the network attach
+  # or the port bind failed. "running" alone is not proof, so check that what we asked
+  # for actually came back.
+  np=$(docker inspect -f '{{len .NetworkSettings.Ports}}' "$name" 2>/dev/null)
+  if [ -z "$(nets_of "$name" | tr -d ' ')" ]; then final="$final but got no network"
+  elif [ "${np:-0}" -lt "$(printf '%s\n' "${args[@]}" | grep -cx -- '-p')" ]; then final="$final but lost its ports"; fi
   if [ "$final" = "running healthy" ] || [ "$final" = "running nohc" ]; then
     docker rm -f "${name}-agent-old" >/dev/null 2>&1
     echo "recreated $name with $key=$val: $final after ${t}s"
   else
-    docker rm -f "$name" >/dev/null 2>&1
-    docker rename "${name}-agent-old" "$name" >/dev/null 2>&1 && docker start "$name" >/dev/null 2>&1
+    restore_old "$name"
     echo "HEALTH GATE FAILED ($final) — rolled back to previous $name"; return 1
   fi
 }
@@ -596,6 +623,17 @@ fi
 
 # --- deterministic floor: repairs we can make without asking the model
 MAIN=$(pick_main)
+
+if [ -n "$MAIN" ] && [ -z "$(nets_of "$MAIN" | tr -d ' ')" ]; then
+  say "The Immich container has no network at all — a previous repair did not finish."
+  if restore_old "$MAIN"; then
+    printf '===== floor: restore_old =====\nrestored %s-agent-old\n' "$MAIN" >>"$EP"
+    echo "  put the previous $MAIN back"
+  else
+    docker network connect bridge "$MAIN" >/dev/null 2>&1 && docker restart "$MAIN" >/dev/null 2>&1 \
+      && echo "  reattached $MAIN to the default network"
+  fi
+fi
 
 if [ -n "$MAIN" ] && { [ -z "$(env_of "$MAIN" REDIS_HOSTNAME)" ] || [ -z "$(env_of "$MAIN" DB_HOSTNAME)" ]; }; then
   say "Immich is missing a setting it needs to find its database or cache. Fixing that first..."
