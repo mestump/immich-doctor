@@ -126,6 +126,7 @@ worked.
 | Nothing appears after a minute | The server can't reach the internet. Check it's on Wi-Fi/Ethernet, then run Step 3 again. |
 | Green "on the network" line, but the phone app can't connect | The Tailscale switch on your phone is off. Turn it on. |
 | Phone app says "server unreachable", Tailscale is on | The server is probably off or restarting. Check it has power. |
+| Android only: Tailscale is on and the server shows a green dot, but Immich alone can't connect | In the Tailscale app, open the menu and check **Select apps** / per-app mode is not excluding Immich. Set it to route all apps. |
 | `/api` mistake — "Immich server is not responding" | You left off `/api` at the end of the address. |
 
 Anything else: photograph the whole screen (all of it, including any red text) and
