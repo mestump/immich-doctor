@@ -1,21 +1,13 @@
 #!/usr/bin/env bash
-# immich-doctor v5 — an agent, delivered by one line of curl.
+# immich-doctor v10 — one line of curl on the Unraid box.
 #
 #   curl -fsSL https://mestump.github.io/immich-doctor/doctor.sh | bash
 #
-# Runs ON the Unraid box as root (the Unraid web terminal already is).
-# Investigates the whole Immich stack (server + redis + postgres + ML), then
-# ACTS: patches dockerMan templates, recreates containers faithfully from the
-# template, restarts services, gates every mutation on health checks with
-# automatic rollback, and reports in plain English. Full transcript uploaded
-# so Mike can review after the fact.
+# If Immich already answers, it says so and exits. If it does not, the
+# stack is unfixable in place (wrong database image) — so this wipes the
+# Immich containers/templates/appdata and runs install.sh. Photos stay.
 #
-# The brain is Spark (reasoning LLM) on the plexivision gateway, with retries
-# and a direct-tailscale fallback. The model only emits one tool call per
-# turn; this script executes it deterministically and keeps the evidence.
-#
-# Env overrides: API_KEY, API_URL, API_FALLBACK_URL, MODEL, PUBLIC_URL,
-# MAX_ROUNDS, DOCTOR_WEBHOOK=discord-webhook, DRYRUN=1, DOCTOR_LIB=1 (functions only).
+# Env overrides: PUBLIC_URL, DRYRUN=1, DOCTOR_LIB=1 (functions only).
 
 [ "${DOCTOR_LIB:-0}" = 1 ] || [ "$(id -u)" = 0 ] || { echo "run as root (Unraid web terminal is)"; exit 2; }
 export PATH=/usr/local/sbin:/usr/sbin:/sbin:/usr/local/bin:/usr/bin:/bin:$PATH
@@ -42,12 +34,6 @@ if [ "${DOCTOR_LIB:-0}" = 1 ]; then
   # lib mode: no keys, no side effects — for offline unit testing of tools
   :
 else
-  API_KEY="${1:-${API_KEY:-}}"
-  [ -n "$API_KEY" ] || for cand in "$(dirname "${BASH_SOURCE[0]:-$0}")/doctor-key.txt" ./doctor-key.txt /tmp/doctor-key.txt; do
-    [ -s "$cand" ] && { API_KEY=$(tr -d '[:space:]' < "$cand"); break; }
-  done
-  [ -n "${API_KEY:-}" ] || API_KEY=$(curl -fsSL "https://mestump.github.io/immich-doctor/doctor-key.txt?v=$RANDOM" 2>/dev/null | tr -d '[:space:]')
-  [ -n "$API_KEY" ] || { echo "no API key — ask Mike."; exit 2; }
   command -v docker >/dev/null 2>&1 || { echo "docker not found — is Docker enabled in Unraid Settings?"; exit 2; }
 fi
 command -v jq >/dev/null 2>&1 || { echo "jq missing (odd on Unraid 6.12+)"; exit 2; }
@@ -543,6 +529,23 @@ run_tool() {
   esac
 }
 
+# Unhealthy stack → wipe and reinstall. Dad pastes doctor.sh; this is the
+# path that actually works. Sibling file when run from the repo, else fetch.
+run_fresh_install() {
+  local url="https://mestump.github.io/immich-doctor/install.sh"
+  local self dir src
+  self="${BASH_SOURCE[0]:-$0}"
+  dir=$(cd "$(dirname "$self")" 2>/dev/null && pwd)
+  if [ -n "$dir" ] && [ -f "$dir/install.sh" ]; then
+    src="$dir/install.sh"
+  else
+    src=$(mktemp /tmp/immich-install.XXXXXX) || { bad "mktemp failed"; return 1; }
+    curl -fsSL "$url" -o "$src" || { bad "could not download install.sh from $url"; return 1; }
+  fi
+  say "handing over to the installer"
+  exec bash "$src"
+}
+
 if [ "${DOCTOR_LIB:-0}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
 
 # ------------------------------------------------------------------ the brain
@@ -613,116 +616,18 @@ healthy_exit() {
   exit 0
 }
 
-say "immich agent online (model=$MODEL, budget $MAX_ROUNDS actions, web $WEB_URL)"
+say "checking Immich at $WEB_URL"
 
-# --- confirm-on-rerun: a working stack never reaches the model at all
+# --- confirm-on-rerun: a working stack is left alone
 CODE=$(web_code)
 if [ "$CODE" = 200 ] || [ "$CODE" = 302 ]; then
   healthy_exit "$CODE" "Nothing to fix — your photos should load normally. You can close this window."
 fi
 
-# --- deterministic floor: repairs we can make without asking the model
-MAIN=$(pick_main)
-
-if [ -n "$MAIN" ] && [ -z "$(nets_of "$MAIN" | tr -d ' ')" ]; then
-  say "The Immich container has no network at all — a previous repair did not finish."
-  if restore_old "$MAIN"; then
-    printf '===== floor: restore_old =====\nrestored %s-agent-old\n' "$MAIN" >>"$EP"
-    echo "  put the previous $MAIN back"
-  else
-    docker network connect bridge "$MAIN" >/dev/null 2>&1 && docker restart "$MAIN" >/dev/null 2>&1 \
-      && echo "  reattached $MAIN to the default network"
-  fi
-fi
-
-if [ -n "$MAIN" ] && { [ -z "$(env_of "$MAIN" REDIS_HOSTNAME)" ] || [ -z "$(env_of "$MAIN" DB_HOSTNAME)" ]; }; then
-  say "Immich is missing a setting it needs to find its database or cache. Fixing that first..."
-  ENVOUT=$(t_fix_env "$MAIN" 2>&1); printf '%s\n' "$ENVOUT"
-  printf '===== floor: fix_env =====\n%s\n' "$ENVOUT" >>"$EP"
-  CODE=$(web_code)
-  if [ "$CODE" = 200 ] || [ "$CODE" = 302 ]; then
-    healthy_exit "$CODE" "Fixed: Immich was missing the address of its database or cache. Photos should load now."
-  fi
-fi
-
-if [ -n "$MAIN" ] && nets_of "$MAIN" | grep -qw bridge; then
-  say "Immich is not answering and its containers are on Unraid's default network,"
-  say "which cannot look each other up by name. Fixing that first..."
-  FIXOUT=$(t_fix_dns 2>&1); printf '%s\n' "$FIXOUT"
-  printf '===== floor: fix_dns =====\n%s\n' "$FIXOUT" >>"$EP"
-  CODE=$(web_code)
-  if [ "$CODE" = 200 ] || [ "$CODE" = 302 ]; then
-    healthy_exit "$CODE" "Fixed: the Immich server can reach its database and cache again. Photos should load now."
-  fi
-  warn "still not answering (HTTP ${CODE:-000}) — handing over to Spark"
-fi
-
-STATE=$(probe "$TMP/bundle.txt")
-REPORT=""; ROUND=0
-
-for ROUND in $(seq 1 "$MAX_ROUNDS"); do
-  ask_spark "$TMP/bundle.txt"
-  if [ -z "$REPLY" ]; then
-    bad "LLM gateway unreachable on both routes"
-    { echo "== FINAL STATE =="; cat "$TMP/bundle.txt"; echo; echo "== EPISODES =="; cat "$EP"; } > /tmp/immich-doctor-transcript.txt
-    exfil_bundle /tmp/immich-doctor-transcript.txt
-    exit 2
-  fi
-  # ponytail: content AND reasoning are both candidates. jq's // keeps "" (truthy),
-  # so `content // reasoning` never fired when the model returned an empty content.
-  CONTENT=$(echo "$REPLY" | jq -r '.choices[0].message.content // empty')
-  RSN=$(echo "$REPLY" | jq -r '.choices[0].message.reasoning // empty')
-  PARSED=""
-  for src in "${CONTENT:-}" "${RSN:-}"; do
-    [ -z "${src//[[:space:]]/}" ] && continue
-    FLAT=$(printf '%s' "$src" | tr '\n' ' ')
-    G1=$(printf '%s' "$FLAT" | sed -n 's/.*\({.*\}\).*/\1/p')      # greedy first-{ to last-}
-    G2=$(printf '%s' "$FLAT" | sed -n 's/.*\({[^{}]*\}\).*/\1/p')  # smallest object
-    for cand in "$FLAT" "$G1" "$G2"; do
-      [ -z "$cand" ] && continue
-      if echo "$cand" | jq -e 'type=="object" and has("tool")' >/dev/null 2>&1; then PARSED="$cand"; break; fi
-    done
-    [ -n "$PARSED" ] && break
-  done
-  if [ -z "$PARSED" ]; then
-    printf '===== round %s: unparseable reply =====\n%s\n' "$ROUND" "$(echo "${CONTENT:-}${RSN:-}" | head -c 600)" >>"$EP"
-    say "model reply unparseable — retrying next round"
-    continue
-  fi
-  TOOL=$(echo "$PARSED" | jq -r '.tool // "report"')
-  THOUGHT=$(echo "$PARSED" | jq -r '.thought // ""')
-  mapfile -t ARGS < <(echo "$PARSED" | jq -r '.args[]?' 2>/dev/null)
-  say "round $ROUND: $TOOL ${ARGS[*]} — $THOUGHT"
-
-  if [ "$TOOL" = report ]; then
-    REPORT="${ARGS[0]:-done}"; break
-  fi
-
-  OUT=$(run_tool "$TOOL" 2>&1 | head -c 2200)
-  printf '===== round %s: %s %s =====\n%s\n' "$ROUND" "$TOOL" "${ARGS[*]}" "$OUT" >>"$EP"
-  STATE=$(probe "$TMP/bundle.txt")   # fresh evidence for the next ask
-done
-
-# ------------------------------------------------------------------- verdict
-LCODE=$(curl -k -s -o /dev/null -m 8 -w '%{http_code}' "$WEB_URL" 2>/dev/null)
-{
-  echo "===== VERDICT ====="
-  echo "checked $WEB_URL -> HTTP ${LCODE:-000}"
-  [ -n "$REPORT" ] && printf 'agent report: %s\n' "$REPORT"
-  echo; cat "$TMP/bundle.txt"
-  echo; echo "===== EPISODES ====="; cat "$EP"
-} > "$TMP/transcript.txt"
-
-[ -n "$REPORT" ] && printf '\n\033[1mAGENT REPORT:\033[0m %s\n' "$REPORT"
-if [ "$LCODE" = 200 ] || [ "$LCODE" = 302 ]; then
-  ok "Immich answers HTTP $LCODE — done."
-  cp "$TMP/transcript.txt" /tmp/immich-doctor-transcript.txt
-  exfil_bundle /tmp/immich-doctor-transcript.txt
-  exit 0
-else
-  bad "no verified healthy Immich (HTTP ${LCODE:-000}) after $MAX_ROUNDS actions."
-  warn "Screenshot your terminal for Mike, or read him the upload URL above."
-  cp "$TMP/transcript.txt" /tmp/immich-doctor-transcript.txt
-  exfil_bundle /tmp/immich-doctor-transcript.txt
-  exit 1
-fi
+# --- broken: do not repair in place. wipe and install.
+say "Immich is not answering (HTTP ${CODE:-000})."
+say "This copy cannot be repaired. Wiping it and installing a clean Immich."
+say "Your photos folder is not touched."
+run_fresh_install
+bad "installer did not start"
+exit 1

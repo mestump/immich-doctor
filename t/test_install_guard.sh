@@ -9,7 +9,7 @@ wipes() { # APPDATA -> "yes"/"no", using the same case pattern as install.sh
   case "$1" in /mnt/user/appdata/?*) echo yes;; *) echo no;; esac
 }
 fail=0
-for p in /mnt/user/appdata/immich /mnt/user/appdata/immich/postgres; do
+for p in /mnt/user/appdata/immich /mnt/user/appdata/immich/postgres /mnt/user/appdata/PostgreSQL_Immich /mnt/user/appdata/immich-postgres; do
   [ "$(wipes "$p")" = yes ] || { echo "FAIL: should wipe $p"; fail=1; }
 done
 for p in / /mnt /mnt/user /mnt/user/appdata /mnt/user/photos "" /boot; do
