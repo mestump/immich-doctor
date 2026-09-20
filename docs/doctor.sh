@@ -36,16 +36,16 @@ trap 'rm -rf "$TMP"' EXIT
 
 # ------------------------------------------------------------------ probing
 probe_local() {
-  # echoes the HTTP code of the Immich web UI (or 000)
-  local p c
-  for p in 2283 8080; do
-    c=$(curl -s -m 6 -o /dev/null -w "%{http_code}" "http://127.0.0.1:${p}/" 2>/dev/null); c=${c:-000}
-    echo "$c" | grep -qE '^(200|302|307|401)$' && { echo "$c"; return; }
-  done
-  for p in $(ss -lnt | awk 'NR>1 {split($4,a,":"); print a[length(a)]}' | sort -un); do
-    c=$(curl -s -m 4 -o /dev/null -w "%{http_code}" "http://127.0.0.1:${p}/" 2>/dev/null); c=${c:-000}
-    if echo "$c" | grep -qE '^(200|302|307|401)$'; then
-      curl -s -m 4 "http://127.0.0.1:${p}/" | grep -qi immich && { echo "$c"; return; }
+  # echoes the HTTP code of the Immich web UI (or 000). A code alone is not
+  # enough — Unraid's nginx (80/443/8080) and other apps answer 200/302 too;
+  # the page body must actually look like Immich.
+  local p c body ports
+  ports="2283 8080 $(ss -lnt | awk 'NR>1 {split($4,a,":"); print a[length(a)]}' | sort -un | tr '\n' ' ')"
+  for p in $(printf '%s\n' $ports | awk '!seen[$0]++'); do
+    body=$(curl -sL -m 6 "http://127.0.0.1:${p}/" 2>/dev/null | head -c 4000)
+    if printf '%s' "$body" | grep -qi immich; then
+      c=$(curl -sL -m 6 -o /dev/null -w "%{http_code}" "http://127.0.0.1:${p}/" 2>/dev/null)
+      echo "${c:-200}"; return
     fi
   done
   echo 000
@@ -97,9 +97,11 @@ gather() { # $1 = bundle path
 }
 
 # ---------------------------------------------------------------- main loop
+LOOP_NEEDED=true
 if wait_healthy 20; then
   ok "Immich is already answering (HTTP $LAST_CODE)"
   fix_restart_policy
+  LOOP_NEEDED=false
 else
   bad "Immich not answering — starting repair loop (max $MAX_ROUNDS rounds)"
 fi
@@ -108,6 +110,7 @@ HISTORY="(this is the first diagnosis; no fixes applied yet)"
 NEEDS_HUMAN=false; HUMAN=""
 ROUND=1
 for ROUND in $(seq 1 "$MAX_ROUNDS"); do
+  [ "$LOOP_NEEDED" = true ] || break
   if [ "$ROUND" -gt 1 ]; then
     # a previous round's fix may just need longer to land
     wait_healthy "$HEAL_WAIT" && break
