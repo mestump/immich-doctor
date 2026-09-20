@@ -3,6 +3,13 @@
 #
 #   curl -fsSL https://mestump.github.io/immich-doctor/tailscale.sh | bash -s -- tskey-auth-XXXX
 #
+# FALLBACK PATH. Unraid 7.3+ has an official Tailscale plugin — install it from
+# the Apps page and enable it under Settings -> Tailscale instead. It installs
+# the binary natively and logs in through the browser, so no auth key is needed.
+# Use this script only when Apps can't install the plugin, and remove the
+# container this makes before installing the plugin, or two Tailscale installs
+# will fight over the tailnet.
+#
 # Run this in the Unraid web terminal (it is root). Needs an auth key from
 # https://login.tailscale.com/admin/settings/keys — Generate auth key, leave
 # everything at its defaults, then copy the long tskey-auth-... string.
