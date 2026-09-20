@@ -315,6 +315,43 @@ t_wait_healthy() { # name seconds
   echo "$n NOT healthy within ${lim}s (last: $st)"; return 1
 }
 
+# ----------------------------------------------------- default-bridge DNS fix
+# Unraid's default `bridge` network has NO container-name resolution, so a
+# compose-managed stack whose env points at DB_HOSTNAME=immich-postgres can
+# never resolve it — and with the dockerMan templates MISSING we cannot
+# recreate containers to change that env. A user-defined network plus network
+# ALIASES fixes both without touching any container's config or data.
+DNET="${DNET:-immich-net}"
+env_of()  { docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null | sed -n "s/^$2=//p" | head -1; }
+nets_of() { docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$1" 2>/dev/null; }
+net_join() { # container [alias] — idempotent
+  local c="$1" a="${2:-}"
+  [ -n "$c" ] || return 0
+  nets_of "$c" | grep -qw "$DNET" && { echo "  $c already on $DNET"; return 0; }
+  if [ -n "$a" ]; then docker network connect --alias "$a" "$DNET" "$c" >/dev/null 2>&1
+  else                 docker network connect "$DNET" "$c" >/dev/null 2>&1; fi
+  if nets_of "$c" | grep -qw "$DNET"; then echo "  joined $c to $DNET${a:+ as \"$a\"}"; else echo "  FAILED to join $c"; return 1; fi
+}
+t_fix_dns() {
+  local main pg rd n img want_db want_rd
+  main=$(pick_main); [ -n "$main" ] || { echo "no main immich container found"; return 1; }
+  nets_of "$main" | grep -qw bridge || { echo "$main is not on the default bridge — nothing to fix"; return 1; }
+  for n in $(stack_names); do
+    img=$(docker inspect -f '{{.Config.Image}}' "$n" 2>/dev/null)
+    case "$img" in *redis*|*valkey*) rd="$n";; *postgres*|*pgvecto*|*pgvector*) pg="$n";; esac
+  done
+  want_db=$(env_of "$main" DB_HOSTNAME);    [ -n "$want_db" ] || want_db=database
+  want_rd=$(env_of "$main" REDIS_HOSTNAME); [ -n "$want_rd" ] || want_rd=redis
+  echo "$main expects db '$want_db' and redis '$want_rd'; found db=${pg:-none} redis=${rd:-none}"
+  docker network inspect "$DNET" >/dev/null 2>&1 || docker network create "$DNET" >/dev/null 2>&1 \
+    || { echo "could not create network $DNET"; return 1; }
+  net_join "$pg"   "$want_db"
+  net_join "$rd"   "$want_rd"
+  net_join "$main" ""
+  docker restart "$main" >/dev/null 2>&1 && echo "  restarted $main to re-resolve" || echo "  restart $main FAILED"
+  t_wait_healthy "$main" 180
+}
+
 run_tool() {
   case "$1" in
     inspect)        t_inspect "${ARGS[@]:-all}" ;;
@@ -331,6 +368,7 @@ run_tool() {
     stop)           t_stop "${ARGS[@]}" ;;
     restart)        t_restart "${ARGS[@]}" ;;
     wait_healthy)   t_wait_healthy "${ARGS[@]}" ;;
+    fix_dns)        t_fix_dns ;;
     *) echo "unknown tool '$1'"; return 1 ;;
   esac
 }
@@ -352,10 +390,14 @@ Tools:
   recreate NAME       rebuild container from its XML template (health-gated, auto-rollback)
   start NAME / stop NAME / restart NAME
   wait_healthy NAME SECONDS   for the main immich container this also requires its web UI to answer
+  fix_dns             put the stack on a user-defined network with aliases matching the
+                      DB_HOSTNAME/REDIS_HOSTNAME env of immich, restart it, wait for its web UI
 Rules:
 - Common Immich failures: config drift (live container missing/wrong REDIS_HOSTNAME or DB_HOSTNAME), template fixed but container never recreated, containers split across docker networks, a container stopped or restarting-looping from bad env, disk full.
 - Investigate with inspect/logs/template/net_test BEFORE acting. One action per turn. Never repeat an action that already failed the same way.
 - patch_template BEFORE recreate — recreate builds the container FROM the template.
+- If STATE says a template is MISSING, the stack is compose-managed: patch_template and recreate CANNOT work on it. Do not try them. Use fix_dns, start/restart, exec and logs, and if the fix needs a compose-file edit, report it.
+- Containers on the default bridge network cannot resolve each other by name at all, whatever the env says. That is what fix_dns repairs, and it was already attempted once before you were called.
 - A container that merely stopped: start it. Recreate only to apply a config fix.
 - If several containers need recreating: postgres first, then redis, then machine-learning, then immich LAST.
 - After recreating the main immich container, finish with wait_healthy immich 180.
@@ -390,7 +432,36 @@ if [ -z "${PUBLIC_URL:-}" ]; then   # ponytail: 2283 is the compose default, not
     [ -n "$hp" ] && { WEB_URL="http://127.0.0.1:$hp/"; break; }
   done
 fi
+web_code() { local pfx=""; case "$WEB_URL" in https://*) pfx=" -k";; esac
+            curl $pfx -s -o /dev/null -m 8 -w '%{http_code}' "$WEB_URL" 2>/dev/null; }
+healthy_exit() {
+  ok "Immich is answering at $WEB_URL (HTTP $1)."
+  ok "$*"
+  exit 0
+}
+
 say "immich agent online (model=$MODEL, budget $MAX_ROUNDS actions, web $WEB_URL)"
+
+# --- confirm-on-rerun: a working stack never reaches the model at all
+CODE=$(web_code)
+if [ "$CODE" = 200 ] || [ "$CODE" = 302 ]; then
+  healthy_exit "$CODE" "Nothing to fix — your photos should load normally. You can close this window."
+fi
+
+# --- deterministic floor: the default-bridge name-resolution fix, before the model
+MAIN=$(pick_main)
+if [ -n "$MAIN" ] && nets_of "$MAIN" | grep -qw bridge; then
+  say "Immich is not answering and its containers are on Unraid's default network,"
+  say "which cannot look each other up by name. Fixing that first..."
+  FIXOUT=$(t_fix_dns 2>&1); printf '%s\n' "$FIXOUT"
+  printf '===== floor: fix_dns =====\n%s\n' "$FIXOUT" >>"$EP"
+  CODE=$(web_code)
+  if [ "$CODE" = 200 ] || [ "$CODE" = 302 ]; then
+    healthy_exit "$CODE" "Fixed: the Immich server can reach its database and cache again. Photos should load now."
+  fi
+  warn "still not answering (HTTP ${CODE:-000}) — handing over to Spark"
+fi
+
 STATE=$(probe "$TMP/bundle.txt")
 REPORT=""; ROUND=0
 

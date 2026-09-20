@@ -1,0 +1,26 @@
+#!/bin/bash
+# fake docker (named `docker` so PATH lookup finds it) for test_fix_dns.sh — replays dad's DstalsNet stack
+log="$FAKE_LOG"
+echo "$*" >>"$log"
+if [ "$1" = ps ]; then
+  if [[ "$*" == *'{{.Image}}'* ]]; then
+    printf 'immich\tghcr.io/imagegenius/immich\nimmich-redis\tvalkey/valkey:9\nPostgreSQL_Immich\ttensorchord/pgvecto-rs:pg16-v0.3.0\n'
+  else
+    printf 'immich\nimmich-redis\nPostgreSQL_Immich\n'
+  fi; exit 0
+fi
+if [ "$1" = inspect ]; then
+  c="${@: -1}"; f="$3"
+  case "$f" in
+    *Config.Env*)   [ "$c" = immich ] && printf 'DB_HOSTNAME=immich-postgres\nDB_PORT=5432\n'; exit 0;;
+    *Config.Image*) case "$c" in immich) echo ghcr.io/imagegenius/immich;; immich-redis) echo valkey/valkey:9;; *) echo tensorchord/pgvecto-rs:pg16-v0.3.0;; esac; exit 0;;
+    *Networks*)     grep -q "^network connect .*$c$" "$log" && echo "bridge immich-net " || echo "bridge "; exit 0;;
+    *State.Status*) echo "running nohc"; exit 0;;
+  esac
+  exit 0
+fi
+[ "$1 $2" = "network inspect" ] && { grep -q '^network create' "$log"; exit $?; }
+[ "$1 $2" = "network create" ] && exit 0
+[ "$1 $2" = "network connect" ] && exit 0
+[ "$1" = restart ] && exit 0
+exit 0
