@@ -160,7 +160,7 @@ while [ $t -lt 300 ]; do
     exit 1
   fi
   code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null || echo 000)
-  case "$code" in 200|302) ok "Immich is up after ${t}s."; ok "Open it at: $URL"; ok "Click 'Getting Started' and make your admin account."; exit 0;; esac
+  case "$code" in 200|302) ok "Immich is up after ${t}s."; ok "Open it at: $URL"; ok "Click 'Getting Started' and make your admin account."; ok "Your Google Photos download: curl -fsSL https://mestump.github.io/immich-doctor/import.sh | bash"; exit 0;; esac
   sleep 10; t=$((t+10))
 done
 
