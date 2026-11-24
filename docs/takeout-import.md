@@ -3,6 +3,11 @@
 Your photos came out of Google as one or more big ZIP files. This page is the
 whole process: two clicks in Google, one line typed in the server's terminal.
 
+> **Prefer the full app?** `curl -fsSL https://mestump.github.io/immich-doctor/migrate.sh | bash`
+> opens a window-based importer with a progress screen, an AI helper you can
+> ask questions, and a report at the end — see [migrate.md](migrate.md).
+> The one-liner below is the same import in plain-terminal form.
+
 ---
 
 ## Step 1 — Ask Google for your photos (on your computer, ~5 min + waiting)
