@@ -82,9 +82,11 @@ if [ "$REFRESH" = 1 ]; then
   exit 0
 fi
 
+say "starting the migrator - a full-screen window takes over in a few seconds ..."
+
 # curl|bash leaves the download pipe on stdin — the TUI would render but no
-# keypress would ever arrive. Rebind stdin to the real terminal.
+# keypress would ever arrive. Hand the app the real terminal, in one exec.
 if [ ! -t 0 ] && [ -r /dev/tty ]; then
-  exec < /dev/tty
+  exec "$UV" run --no-project --python "$PY" "$SCRIPT" "$@" < /dev/tty
 fi
 exec "$UV" run --no-project --python "$PY" "$SCRIPT" "$@"
