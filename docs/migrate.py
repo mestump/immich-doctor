@@ -796,10 +796,36 @@ class ConnectScreen(Screen):  # type: ignore[misc]
             with Horizontal(classes="btnrow"):
                 yield Button("Connect and scan", id="connect", variant="success")
                 yield Button("Settings", id="settings")
+            yield Static("TAB = next box  ·  ENTER = connect", classes="dim", id="hint")
             yield Static("", id="status")
 
     def on_mount(self) -> None:
         self.query_one("#server", Input).focus()
+
+    def _keep_focus(self) -> None:
+        # Clicking blank space clears focus in some terminals; put it back.
+        if self.focused is None:
+            try:
+                self.query_one("#server", Input).focus()
+            except Exception:
+                pass
+
+    def on_click(self) -> None:
+        self._keep_focus()
+
+    def on_screen_resume(self) -> None:
+        self._keep_focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        order = ["#server", "#key", "#cpath"]
+        try:
+            idx = order.index(f"#{event.input.id}")
+        except ValueError:
+            return
+        if idx + 1 < len(order):
+            self.query_one(order[idx + 1], Input).focus()
+        else:
+            self.query_one("#connect", Button).press()
 
     def set_status(self, text: str) -> None:
         try:
@@ -846,6 +872,19 @@ class SettingsScreen(Screen):  # type: ignore[misc]
         app.cfg["spark_url"] = self.query_one("#sp-url", Input).value.strip()
         app.cfg["spark_key"] = self.query_one("#sp-key", Input).value.strip()
         app.cfg["spark_model"] = self.query_one("#sp-model", Input).value.strip() or "spark-prod"
+
+    def _keep_focus(self) -> None:
+        if self.focused is None:
+            try:
+                self.query_one("#sp-url", Input).focus()
+            except Exception:
+                pass
+
+    def on_click(self) -> None:
+        self._keep_focus()
+
+    def on_screen_resume(self) -> None:
+        self._keep_focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         app = self.app
