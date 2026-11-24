@@ -81,4 +81,10 @@ if [ "$REFRESH" = 1 ]; then
   ok "updated. run again without 'update' to start the migrator."
   exit 0
 fi
+
+# curl|bash leaves the download pipe on stdin — the TUI would render but no
+# keypress would ever arrive. Rebind stdin to the real terminal.
+if [ ! -t 0 ] && [ -r /dev/tty ]; then
+  exec < /dev/tty
+fi
 exec "$UV" run --no-project --python "$PY" "$SCRIPT" "$@"

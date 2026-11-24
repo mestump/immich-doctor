@@ -1451,12 +1451,25 @@ def headless_scan(path: str | None) -> int:
     return 0
 
 
+def _rescue_stdin() -> None:
+    """curl|bash leaves a dead pipe on stdin: TUI renders, no keys arrive."""
+    try:
+        if not sys.stdin.isatty() and os.path.exists("/dev/tty"):
+            fd = os.open("/dev/tty", os.O_RDONLY)
+            os.close(0)
+            os.dup2(fd, 0)
+            os.close(fd)
+    except Exception:  # noqa: BLE001 - best effort; any failure keeps status quo
+        pass
+
+
 def main(argv: list[str]) -> int:
     if len(argv) > 1 and argv[1] in ("--version", "version"):
         print(f"Pop's Migrator {VERSION} (immich-go {IG_VERSION})")
         return 0
     if len(argv) > 1 and argv[1] == "scan":
         return headless_scan(argv[2] if len(argv) > 2 else None)
+    _rescue_stdin()
     MigrateApp(cfg=load_config()).run()
     return 0
 
